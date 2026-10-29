@@ -31,8 +31,17 @@ if t.TYPE_CHECKING:
 
 ParamTypeValue = t.TypeVar("ParamTypeValue")
 
+#: The converted value of a type, and the value it accepts. The input
+#: defaults to ``Any`` so that ``ParamType[int]`` is enough.
+if sys.version_info >= (3, 13):
+    ParamTypeInput = t.TypeVar("ParamTypeInput", default=t.Any)  # type: ignore[call-arg]
+else:  # pragma: no cover
+    ParamTypeInput = t.TypeVar("ParamTypeInput")
 
-class ParamType(t.Generic[ParamTypeValue]):
+PathValue = t.TypeVar("PathValue")
+
+
+class ParamType(t.Generic[ParamTypeValue, ParamTypeInput]):
     """Base class for parameter types.
 
     Subclasses set :attr:`name` and implement :meth:`convert`. Conversion
@@ -42,6 +51,14 @@ class ParamType(t.Generic[ParamTypeValue]):
 
     is_composite: t.ClassVar[bool] = False
     arity: t.ClassVar[int] = 1
+
+    if sys.version_info < (3, 13):  # pragma: no cover
+
+        def __class_getitem__(cls, params: t.Any) -> t.Any:
+            # Backfill the input parameter's default for older Pythons.
+            if cls is ParamType and not isinstance(params, tuple):
+                params = (params, t.Any)
+            return super().__class_getitem__(params)  # type: ignore[misc]
 
     #: Shown in help and error messages.
     name: str
@@ -129,11 +146,14 @@ class FuncParamType(ParamType):
     ) -> t.Any:
         try:
             return self.func(value)
-        except ValueError:
-            try:
-                text = str(value)
-            except UnicodeError:
-                text = value.decode("utf-8", "replace")
+        except ValueError as e:
+            # Prefer the function's own explanation; fall back to the value.
+            text = str(e)
+            if not text:
+                try:
+                    text = str(value)
+                except UnicodeError:
+                    text = value.decode("utf-8", "replace")
             self.fail(text, param, ctx)
 
 
@@ -257,13 +277,10 @@ class Choice(ParamType[ParamTypeValue]):
     ) -> list[CompletionItem]:
         from .shell_completion import CompletionItem
 
-        labels = [self._label(c) for c in self.choices]
-        if self.case_sensitive:
-            found = [s for s in labels if s.startswith(incomplete)]
-        else:
-            low = incomplete.lower()
-            found = [s for s in labels if s.lower().startswith(low)]
-        return [CompletionItem(s) for s in found]
+        labels = list(self._normalized_mapping(ctx).values())
+        if not self.case_sensitive:
+            incomplete = incomplete.casefold()
+        return [CompletionItem(s) for s in labels if s.startswith(incomplete)]
 
 
 class DateTime(ParamType):
@@ -586,7 +603,7 @@ class File(ParamType):
         return [CompletionItem(incomplete, type="file")]
 
 
-class Path(ParamType):
+class Path(ParamType[PathValue]):
     """A filesystem path, optionally checked for existence, kind and
     permissions. The value is not opened.
 
@@ -663,7 +680,9 @@ class Path(ParamType):
         ctx: Context | None,
     ) -> str | bytes | os.PathLike[str]:
         path = value
-        if self.file_okay and self.allow_dash and path in (b"-", "-"):
+        # Compare like with like, ``b"-" == "-"`` warns under ``python -b``.
+        dash: str | bytes = b"-" if isinstance(path, bytes) else "-"
+        if self.file_okay and self.allow_dash and path == dash:
             return self.coerce_path_result(path)
 
         if self.resolve_path:

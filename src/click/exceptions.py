@@ -154,6 +154,11 @@ class MissingParameter(BadParameter):
         hint = self._hint()
         hint_part = f" {hint}" if hint else ""
 
+        envvars = self._shown_envvars()
+        if envvars:
+            listing = ", ".join(repr(e) for e in envvars)
+            hint_part += " " + _("(env var: {var})").format(var=listing)
+
         kind = self.param_type
         if kind is None and self.param is not None:
             kind = self.param.param_type_name
@@ -177,6 +182,15 @@ class MissingParameter(BadParameter):
             label = _("Missing {param_type}").format(param_type=kind)
 
         return f"{label}{hint_part}.{msg_part}"
+
+    def _shown_envvars(self) -> tuple[str, ...]:
+        """Environment variables that could have provided the value, if
+        the option shows them in its help.
+        """
+        param = self.param
+        if param is None or self.ctx is None or not getattr(param, "show_envvar", False):
+            return ()
+        return param._envvar_names(self.ctx)  # type: ignore[attr-defined, no-any-return]
 
     def __str__(self) -> str:
         if not self.message:

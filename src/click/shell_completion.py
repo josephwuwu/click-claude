@@ -486,13 +486,13 @@ def _is_incomplete_option(ctx: Context, args: list[str], param: Parameter) -> bo
     if not isinstance(param, Option) or param.is_flag or param.count:
         return False
 
-    last_option = None
+    # Look back at most ``nargs`` words for the closest option name.
     for seen, arg in enumerate(reversed(args), start=1):
         if seen > param.nargs:
             break
         if _start_of_option(ctx, arg):
-            last_option = arg
-    return last_option is not None and last_option in param.opts
+            return arg in param.opts
+    return False
 
 
 def _resolve_context(
