@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "click"
-version = "8.3.0.dev0"
+version = "8.6.0.dev0"
 description = "Composable command line interface toolkit (clean-room reimplementation)"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}

@@ -71,7 +71,7 @@ def _unpack_args(
 
     def take(count: int, from_end: bool) -> list[t.Any]:
         taken: list[t.Any] = []
-        for _ in range(count):
+        for _index in range(count):
             if not pool:
                 taken.append(None)
             elif from_end:

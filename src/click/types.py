@@ -19,12 +19,10 @@ from ._compat import get_filesystem_encoding
 from ._compat import open_stream
 from .exceptions import BadParameter
 from .utils import _LazyFile
-from .utils import format_filename
 from .utils import _safecall
+from .utils import format_filename
 
 if t.TYPE_CHECKING:
-    import typing_extensions as te
-
     from .core import Context
     from .core import Parameter
     from .shell_completion import CompletionItem
