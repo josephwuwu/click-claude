@@ -35,7 +35,7 @@ def _posixify(name: str) -> str:
     return "-".join(name.split()).lower()
 
 
-def safecall(func: t.Callable[P, R]) -> t.Callable[P, R | None]:
+def _safecall(func: t.Callable[P, R]) -> t.Callable[P, R | None]:
     """Wrap ``func`` so that any exception it raises is swallowed."""
 
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R | None:
@@ -59,7 +59,7 @@ def make_str(value: t.Any) -> str:
     return str(value)
 
 
-def make_default_short_help(help: str, max_length: int = 45) -> str:
+def _make_default_short_help(help: str, max_length: int = 45) -> str:
     """Derive a one-line summary from a help text.
 
     Only the first paragraph is considered. The summary ends at the first
@@ -101,7 +101,7 @@ def make_default_short_help(help: str, max_length: int = 45) -> str:
     return " ".join(kept) + "..."
 
 
-class LazyFile:
+class _LazyFile:
     """A file that is only opened on first use. Files opened for reading
     are checked right away so that errors show up early; files for writing
     are only created when something is written.
@@ -165,7 +165,7 @@ class LazyFile:
         if self.should_close:
             self.close()
 
-    def __enter__(self) -> LazyFile:
+    def __enter__(self) -> _LazyFile:
         return self
 
     def __exit__(
@@ -181,7 +181,7 @@ class LazyFile:
         return iter(self._f)  # type: ignore[arg-type]
 
 
-class KeepOpenFile:
+class _KeepOpenFile:
     """Proxy for a file that should survive being used in a ``with`` block,
     such as ``sys.stdout``.
     """
@@ -192,7 +192,7 @@ class KeepOpenFile:
     def __getattr__(self, name: str) -> t.Any:
         return getattr(self._file, name)
 
-    def __enter__(self) -> KeepOpenFile:
+    def __enter__(self) -> _KeepOpenFile:
         return self
 
     def __exit__(
@@ -208,6 +208,17 @@ class KeepOpenFile:
 
     def __iter__(self) -> cabc.Iterator[t.AnyStr]:
         return iter(self._file)
+
+
+def _default_text_stdout() -> t.TextIO | None:
+    """The stream :func:`echo` writes to by default. ``None`` when there
+    is no console, for example under pythonw.
+    """
+    return sys.stdout
+
+
+def _default_text_stderr() -> t.TextIO | None:
+    return sys.stderr
 
 
 def echo(
@@ -231,7 +242,7 @@ def echo(
     :param color: force styling on or off.
     """
     if file is None:
-        file = sys.stderr if err else sys.stdout
+        file = _default_text_stderr() if err else _default_text_stdout()
         if file is None:
             # No console, for example under pythonw.
             return
@@ -276,7 +287,7 @@ def echo(
     file.flush()
 
 
-def get_binary_stream(name: t.Literal["stdin", "stdout", "stderr"]) -> t.BinaryIO:
+def _get_binary_stream(name: t.Literal["stdin", "stdout", "stderr"]) -> t.BinaryIO:
     """Return the binary layer of a standard stream."""
     opener = binary_streams.get(name)
     if opener is None:
@@ -284,7 +295,7 @@ def get_binary_stream(name: t.Literal["stdin", "stdout", "stderr"]) -> t.BinaryI
     return opener()
 
 
-def get_text_stream(
+def _get_text_stream(
     name: t.Literal["stdin", "stdout", "stderr"],
     encoding: str | None = None,
     errors: str | None = "strict",
@@ -316,11 +327,11 @@ def open_file(
     """
     if lazy:
         return t.cast(
-            "t.IO[t.Any]", LazyFile(filename, mode, encoding, errors, atomic=atomic)
+            "t.IO[t.Any]", _LazyFile(filename, mode, encoding, errors, atomic=atomic)
         )
     f, should_close = open_stream(filename, mode, encoding, errors, atomic=atomic)
     if not should_close:
-        f = t.cast("t.IO[t.Any]", KeepOpenFile(f))
+        f = t.cast("t.IO[t.Any]", _KeepOpenFile(f))
     return f
 
 
@@ -364,7 +375,7 @@ def get_app_dir(app_name: str, roaming: bool = True, force_posix: bool = False) 
     return os.path.join(base, _posixify(app_name))
 
 
-class PacifyFlushWrapper:
+class _PacifyFlushWrapper:
     """Wrap a stream so that a broken pipe on flush is ignored. Used to
     keep the interpreter quiet when output is piped into a program that
     exits early.
@@ -441,3 +452,28 @@ def _expand_args(
             matches = []
         out.extend(matches if matches else [arg])
     return out
+
+
+_DEPRECATED = {
+    "LazyFile": "_LazyFile",
+    "KeepOpenFile": "_KeepOpenFile",
+    "make_default_short_help": "_make_default_short_help",
+    "PacifyFlushWrapper": "_PacifyFlushWrapper",
+    "safecall": "_safecall",
+    "get_binary_stream": "_get_binary_stream",
+    "get_text_stream": "_get_text_stream",
+}
+
+
+def __getattr__(name: str) -> object:
+    if name in _DEPRECATED:
+        import warnings
+
+        warnings.warn(
+            f"'utils.{name}' is deprecated and will be removed in Click 9.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return globals()[_DEPRECATED[name]]
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

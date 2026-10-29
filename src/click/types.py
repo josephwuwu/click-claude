@@ -18,9 +18,9 @@ from gettext import ngettext
 from ._compat import get_filesystem_encoding
 from ._compat import open_stream
 from .exceptions import BadParameter
-from .utils import LazyFile
+from .utils import _LazyFile
 from .utils import format_filename
-from .utils import safecall
+from .utils import _safecall
 
 if t.TYPE_CHECKING:
     import typing_extensions as te
@@ -563,7 +563,7 @@ class File(ParamType):
         path = t.cast("str | os.PathLike[str]", value)
         try:
             if self.resolve_lazy_flag(path):
-                lazy = LazyFile(path, self.mode, self.encoding, self.errors, atomic=self.atomic)
+                lazy = _LazyFile(path, self.mode, self.encoding, self.errors, atomic=self.atomic)
                 if ctx is not None:
                     ctx.call_on_close(lazy.close_intelligently)
                 return t.cast("t.IO[t.Any]", lazy)
@@ -573,7 +573,7 @@ class File(ParamType):
             )
             if ctx is not None:
                 # Standard streams are only flushed, never closed.
-                ctx.call_on_close(safecall(f.close if should_close else f.flush))
+                ctx.call_on_close(_safecall(f.close if should_close else f.flush))
             return f
         except OSError as e:
             self.fail(f"'{format_filename(path)}': {e.strerror}", param, ctx)

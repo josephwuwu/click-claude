@@ -20,6 +20,7 @@ from itertools import repeat
 from types import TracebackType
 
 from . import types
+from ._utils import UNSET
 from .exceptions import Abort
 from .exceptions import BadParameter
 from .exceptions import ClickException
@@ -37,11 +38,11 @@ from .parser import _split_opt
 from .termui import confirm
 from .termui import prompt
 from .termui import style
-from .utils import PacifyFlushWrapper
+from .utils import _PacifyFlushWrapper
 from .utils import _detect_program_name
 from .utils import _expand_args
 from .utils import echo
-from .utils import make_default_short_help
+from .utils import _make_default_short_help
 from .utils import make_str
 
 if t.TYPE_CHECKING:
@@ -273,6 +274,11 @@ class Context:
         self._close_callbacks: list[t.Callable[[], t.Any]] = []
         self._depth = 0
         self._parameter_source: dict[str, ParameterSource] = {}
+        # Bookkeeping for parameters that share a name: how strong the
+        # stored value is, and which parameter used the name on the
+        # command line.
+        self._param_ranks: dict[str, int] = {}
+        self._param_owners: dict[str, Parameter] = {}
         self._exit_stack = ExitStack()
 
     @property
@@ -410,7 +416,9 @@ class Context:
         """
         if self.default_map is None:
             return None
-        value = self.default_map.get(name)
+        value = self.default_map.get(name, UNSET)
+        if value is UNSET:
+            return None
         if call and callable(value):
             return value()
         return value
@@ -461,8 +469,11 @@ class Context:
             ctx = self._make_sub_context(other)
             for param in other.params:
                 if param.name not in kwargs and param.expose_value:
+                    default = param.get_default(ctx)
+                    if default is UNSET:
+                        default = None
                     kwargs[param.name] = param.type_cast_value(  # type: ignore
-                        ctx, param.get_default(ctx)
+                        ctx, default
                     )
             # Record them so that a later ``forward`` passes them on.
             ctx.params.update(kwargs)
@@ -492,6 +503,37 @@ class Context:
         it was not processed.
         """
         return self._parameter_source.get(name)
+
+
+def _warn_about_shared_names(params: cabc.Sequence[Parameter]) -> None:
+    """Warn about option strings declared twice, and about arguments whose
+    name another parameter also uses. Options sharing a name on purpose,
+    like feature switches, are fine.
+    """
+    import warnings
+
+    counts = Counter(opt for param in params for opt in param.opts)
+    for opt, count in counts.items():
+        if count > 1:
+            warnings.warn(
+                f"The parameter {opt} is used more than once. Remove its"
+                " duplicate as parameters should be unique.",
+                stacklevel=4,
+            )
+
+    names = Counter(param.name for param in params if param.expose_value)
+    for param in params:
+        if (
+            isinstance(param, Argument)
+            and param.expose_value
+            and names[param.name] > 1
+        ):
+            warnings.warn(
+                f"The parameter name {param.name!r} is used by an argument and"
+                " another parameter, so their values overwrite each other.",
+                stacklevel=4,
+            )
+            names[param.name] = 0
 
 
 class Command:
@@ -577,16 +619,7 @@ class Command:
             params.append(help_option)
 
         if __debug__:
-            import warnings
-
-            counts = Counter(opt for param in params for opt in param.opts)
-            for opt, count in counts.items():
-                if count > 1:
-                    warnings.warn(
-                        f"The parameter {opt} is used more than once. Remove its"
-                        " duplicate as parameters should be unique.",
-                        stacklevel=3,
-                    )
+            _warn_about_shared_names(params)
         return params
 
     def format_usage(self, ctx: Context, formatter: HelpFormatter) -> None:
@@ -650,7 +683,7 @@ class Command:
         if self.short_help:
             text = inspect.cleandoc(self.short_help)
         elif self.help:
-            text = make_default_short_help(self.help, limit)
+            text = _make_default_short_help(self.help, limit)
         else:
             text = ""
         if self.deprecated:
@@ -678,9 +711,24 @@ class Command:
             with formatter.indentation():
                 formatter.write_text(text)
 
+    def format_arguments(self, ctx: Context, formatter: HelpFormatter) -> None:
+        """Write the "Positional arguments" section. It is only shown if at
+        least one argument is documented, and then lists all of them.
+        """
+        arguments = [p for p in self.get_params(ctx) if isinstance(p, Argument)]
+        if not any(a.help is not None or a.deprecated for a in arguments):
+            return
+        records = [a.get_help_record(ctx) for a in arguments]
+        with formatter.section(_("Positional arguments")):
+            formatter.write_dl(records)
+
     def format_options(self, ctx: Context, formatter: HelpFormatter) -> None:
+        """Write the arguments and options sections."""
+        self.format_arguments(ctx, formatter)
         records = []
         for param in self.get_params(ctx):
+            if isinstance(param, Argument):
+                continue
             record = param.get_help_record(ctx)
             if record is not None:
                 records.append(record)
@@ -717,9 +765,15 @@ class Command:
 
         parser = self.make_parser(ctx)
         opts, args, order = parser.parse_args(args=args)
+        ctx._param_owners = dict(parser._owners)
 
         for param in iter_params_for_processing(order, self.get_params(ctx)):
             _, args = param.handle_parse_result(ctx, opts, args)
+
+        # Values that were never provided are passed on as None.
+        for name, value in ctx.params.items():
+            if value is UNSET:
+                ctx.params[name] = None
 
         if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
             ctx.fail(
@@ -769,6 +823,18 @@ class Command:
                     for name in [*param.opts, *param.secondary_opts]
                     if name.startswith(incomplete)
                 )
+
+        # Inside a chained group, the sibling commands that were not used
+        # yet can follow.
+        parent = ctx.parent
+        while parent is not None:
+            if isinstance(parent.command, Group) and parent.command.chain:
+                results.extend(
+                    CompletionItem(name, help=command.get_short_help_str())
+                    for name, command in _complete_visible_commands(parent, incomplete)
+                    if name not in parent._protected_args
+                )
+            parent = parent.parent
         return results
 
     @t.overload
@@ -845,8 +911,8 @@ class Command:
                 if e.errno != errno.EPIPE:
                     raise
                 # The reader went away; silence further flush errors.
-                sys.stdout = t.cast(t.TextIO, PacifyFlushWrapper(sys.stdout))
-                sys.stderr = t.cast(t.TextIO, PacifyFlushWrapper(sys.stderr))
+                sys.stdout = t.cast(t.TextIO, _PacifyFlushWrapper(sys.stdout))
+                sys.stderr = t.cast(t.TextIO, _PacifyFlushWrapper(sys.stderr))
                 sys.exit(1)
         except Exit as e:
             if standalone_mode:
@@ -1152,7 +1218,15 @@ class Group(Command):
             if _split_opt(cmd_name)[0]:
                 # Looks like an option; let the parser produce the error.
                 self.parse_args(ctx, args)
-            ctx.fail(_("No such command {name!r}.").format(name=original))
+            from difflib import get_close_matches
+
+            from .exceptions import _suggestion
+
+            message = _("No such command {name!r}.").format(name=original)
+            hint = _suggestion(get_close_matches(original, self.list_commands(ctx)))
+            if hint:
+                message = f"{message} {hint}"
+            ctx.fail(message)
 
         return (cmd_name if cmd else None), cmd, args[1:]
 
@@ -1215,6 +1289,47 @@ def _check_iter(value: t.Any) -> cabc.Iterator[t.Any]:
     return iter(value)
 
 
+def _transform_name(text: str) -> str:
+    """Turn a declaration into a parameter name: dashes become underscores
+    and the result is lower cased.
+    """
+    return text.replace("-", "_").lower()
+
+
+def _warn_about_name(name: str, kind: str) -> None:
+    """Warn about names that cannot be passed as keyword arguments."""
+    import keyword
+    import warnings
+
+    if not name.isidentifier():
+        warnings.warn(
+            f"The {kind} name {name!r} is not a valid Python identifier, so it"
+            " can only be received through '**kwargs'. Click 9.0 will refuse"
+            " it; use a declaration that transforms into an identifier.",
+            DeprecationWarning,
+            stacklevel=4,
+        )
+    elif keyword.iskeyword(name):
+        warnings.warn(
+            f"The {kind} name {name!r} is a Python keyword, so it can only be"
+            " received through '**kwargs'. Click 9.0 will refuse it; pass an"
+            " explicit name.",
+            DeprecationWarning,
+            stacklevel=4,
+        )
+
+
+# How strongly a value claims its parameter name. When several parameters
+# share a name, the value with the highest rank is kept; on a tie the
+# parameter processed last wins.
+_RANK_UNSET = 0
+_RANK_IMPLICIT_DEFAULT = 1
+_RANK_EXPLICIT_DEFAULT = 2
+_RANK_DEFAULT_MAP = 3
+_RANK_ENVIRONMENT = 4
+_RANK_COMMANDLINE = 5
+
+
 class Parameter:
     """Base class for :class:`Option` and :class:`Argument`.
 
@@ -1243,7 +1358,7 @@ class Parameter:
         param_decls: cabc.Sequence[str] | None = None,
         type: types.ParamType | t.Any | None = None,
         required: bool = False,
-        default: t.Any | t.Callable[[], t.Any] | None = None,
+        default: t.Any | t.Callable[[], t.Any] | None = UNSET,
         callback: t.Callable[[Context, Parameter, t.Any], t.Any] | None = None,
         nargs: int | None = None,
         multiple: bool = False,
@@ -1263,7 +1378,9 @@ class Parameter:
         self.name, self.opts, self.secondary_opts = self._parse_decls(
             param_decls or (), expose_value
         )
-        self.type: types.ParamType = types.convert_type(type, default)
+        self.type: types.ParamType = types.convert_type(
+            type, None if default is UNSET else default
+        )
 
         if nargs is None:
             nargs = self.type.arity if self.type.is_composite else 1
@@ -1274,6 +1391,8 @@ class Parameter:
         self.multiple = multiple
         self.expose_value = expose_value
         self.default = default
+        #: Whether the default was given by the user rather than derived.
+        self._explicit_default = default is not UNSET
         self.is_eager = is_eager
         self.metavar = metavar
         self.envvar = envvar
@@ -1281,48 +1400,17 @@ class Parameter:
         self.deprecated = deprecated
 
         if __debug__:
-            self._validate_settings(default)
-
-    def _validate_settings(self, default: t.Any) -> None:
-        nargs = self.nargs
-        if self.type.is_composite and nargs != self.type.arity:
-            raise ValueError(
-                f"'nargs' must be {self.type.arity} (or None) for"
-                f" type {self.type!r}, but it was {nargs}."
-            )
-
-        sample = None if callable(default) else default
-        if sample is not None and self.multiple:
-            try:
-                sample = next(_check_iter(sample), None)
-            except TypeError:
+            if self.type.is_composite and nargs != self.type.arity:
                 raise ValueError(
-                    "'default' must be a list when 'multiple' is true."
-                ) from None
-
-        if sample is not None and nargs != 1:
-            try:
-                _check_iter(sample)
-            except TypeError:
-                if self.multiple:
-                    message = (
-                        "'default' must be a list of lists when 'multiple' is"
-                        " true and 'nargs' != 1."
-                    )
-                else:
-                    message = "'default' must be a list when 'nargs' != 1."
-                raise ValueError(message) from None
-
-            if nargs > 1 and len(sample) != nargs:
-                subject = "item length" if self.multiple else "length"
-                raise ValueError(f"'default' {subject} must match nargs={nargs}.")
-
-        if self.required and self.deprecated:
-            raise ValueError(
-                f"The {self.param_type_name} '{self.human_readable_name}' is"
-                " deprecated and still required. A deprecated"
-                f" {self.param_type_name} cannot be required."
-            )
+                    f"'nargs' must be {self.type.arity} (or None) for"
+                    f" type {self.type!r}, but it was {nargs}."
+                )
+            if required and deprecated:
+                raise ValueError(
+                    f"The {self.param_type_name} '{self.spec}' is"
+                    " deprecated and still required. A deprecated"
+                    f" {self.param_type_name} cannot be required."
+                )
 
     def to_info_dict(self) -> dict[str, t.Any]:
         return {
@@ -1334,9 +1422,22 @@ class Parameter:
             "required": self.required,
             "nargs": self.nargs,
             "multiple": self.multiple,
-            "default": self.default,
+            "default": None if self.default is UNSET else self.default,
             "envvar": self.envvar,
         }
+
+    def __init_subclass__(cls, **kwargs: t.Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "human_readable_name" in cls.__dict__:
+            import warnings
+
+            warnings.warn(
+                f"{cls.__name__} overrides 'human_readable_name', which is"
+                " deprecated and no longer used by Click. Override 'spec'"
+                " instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__} {self.name}>"
@@ -1347,9 +1448,24 @@ class Parameter:
         raise NotImplementedError()
 
     @property
+    def spec(self) -> str:
+        """How the parameter is referred to in messages: the main option
+        string of an option, the metavar of an argument.
+        """
+        return self.name or ""
+
+    @property
     def human_readable_name(self) -> str:
-        """Name used in error messages."""
-        return self.name  # type: ignore
+        """Deprecated alias of :attr:`spec`."""
+        import warnings
+
+        warnings.warn(
+            "'human_readable_name' is deprecated and will be removed in"
+            " Click 9.0. Use 'spec' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.spec
 
     def make_metavar(self, ctx: Context) -> str:
         if self.metavar is not None:
@@ -1360,6 +1476,25 @@ class Parameter:
         if self.nargs != 1:
             metavar += "..."
         return metavar
+
+    def _lookup_default_map(self, ctx: Context, call: bool) -> t.Any:
+        """The value for this parameter in the context's ``default_map``,
+        or ``UNSET`` if there is none. A ``None`` from
+        :meth:`Context.lookup_default` counts as a value only if the map
+        really contains ``None`` for the name.
+        """
+        if self.name is None:
+            return UNSET
+        value = ctx.lookup_default(self.name, call=False)
+        if value is UNSET:
+            return UNSET
+        if value is None:
+            mapping = ctx.default_map
+            if mapping is None or mapping.get(self.name, UNSET) is not None:
+                return UNSET
+        if call and callable(value):
+            value = ctx.lookup_default(self.name, call=True)
+        return value
 
     @t.overload
     def get_default(self, ctx: Context, call: t.Literal[True] = True) -> t.Any | None: ...
@@ -1374,9 +1509,10 @@ class Parameter:
     ) -> t.Any | t.Callable[[], t.Any] | None:
         """The default value, taken from the context's ``default_map``
         first. Callable defaults are called unless ``call`` is false.
+        Returns ``UNSET`` if there is no default.
         """
-        value = ctx.lookup_default(self.name, call=False)  # type: ignore[arg-type]
-        if value is None:
+        value = self._lookup_default_map(ctx, call=False)
+        if value is UNSET:
             value = self.default
         if call and callable(value):
             value = value()
@@ -1391,18 +1527,34 @@ class Parameter:
         """Find the raw value: command line, then environment, then
         ``default_map``, then the default.
         """
-        value = opts.get(self.name)  # type: ignore[arg-type]
+        value = UNSET
+        if self.name in opts:
+            owners = getattr(ctx, "_param_owners", {})
+            # Several parameters may share a name; only the one that was
+            # actually used on the command line takes the value.
+            if owners.get(self.name, self) is self:  # type: ignore[arg-type]
+                value = opts[self.name]  # type: ignore[index]
         source = ParameterSource.COMMANDLINE
 
-        if value is None:
-            value = self.value_from_envvar(ctx)
-            source = ParameterSource.ENVIRONMENT
-        if value is None:
-            value = ctx.lookup_default(self.name)  # type: ignore[arg-type]
-            source = ParameterSource.DEFAULT_MAP
-        if value is None:
+        if value is UNSET:
+            env_value = self.value_from_envvar(ctx)
+            if env_value is not None:
+                value = env_value
+                source = ParameterSource.ENVIRONMENT
+
+        if value is UNSET:
+            mapped = self._lookup_default_map(ctx, call=True)
+            if mapped is not UNSET:
+                value = mapped
+                source = ParameterSource.DEFAULT_MAP
+                if isinstance(value, str) and self.nargs != 1:
+                    # Split like an environment variable would be.
+                    value = self.type.split_envvar_value(value)
+
+        if value is UNSET:
             value = self.get_default(ctx)
             source = ParameterSource.DEFAULT
+
         return value, source
 
     def type_cast_value(self, ctx: Context, value: t.Any) -> t.Any:
@@ -1452,22 +1604,44 @@ class Parameter:
         return convert(value)
 
     def value_is_missing(self, value: t.Any) -> bool:
-        if value is None:
+        if value is UNSET:
             return True
-        if (self.nargs != 1 or self.multiple) and value == ():
+        if (self.nargs != 1 or self.multiple) and isinstance(value, tuple) and not value:
             return True
         return False
 
     def process_value(self, ctx: Context, value: t.Any) -> t.Any:
         """Convert, check that required values are present, and run the
-        callback.
+        callback. An unset value is never passed to the type or callback.
         """
-        value = self.type_cast_value(ctx, value)
+        if value is UNSET:
+            if self.multiple or self.nargs == -1:
+                value = ()
+        else:
+            value = self.type_cast_value(ctx, value)
+
         if self.required and self.value_is_missing(value):
             raise MissingParameter(ctx=ctx, param=self)
+
         if self.callback is not None:
-            value = self.callback(ctx, self, value)
+            value = self._invoke_callback(ctx, value)
         return value
+
+    def _invoke_callback(self, ctx: Context, value: t.Any) -> t.Any:
+        """Run the callback with unset values shown as ``None``, both for
+        this parameter and for the others in ``ctx.params``.
+        """
+        assert self.callback is not None
+        hidden = [name for name, v in ctx.params.items() if v is UNSET]
+        for name in hidden:
+            ctx.params[name] = None
+        try:
+            return self.callback(ctx, self, None if value is UNSET else value)
+        finally:
+            for name in hidden:
+                # Restore the marker unless the callback set a real value.
+                if name in ctx.params and ctx.params[name] is None:
+                    ctx.params[name] = UNSET
 
     def resolve_envvar_value(self, ctx: Context) -> str | None:
         """The first non-empty value of the configured environment
@@ -1488,10 +1662,25 @@ class Parameter:
             rv = self.type.split_envvar_value(rv)
         return rv
 
+    def _rank(self, source: ParameterSource, value: t.Any) -> int:
+        if value is UNSET:
+            return _RANK_UNSET
+        if source in (ParameterSource.COMMANDLINE, ParameterSource.PROMPT):
+            return _RANK_COMMANDLINE
+        if source is ParameterSource.ENVIRONMENT:
+            return _RANK_ENVIRONMENT
+        if source is ParameterSource.DEFAULT_MAP:
+            return _RANK_DEFAULT_MAP
+        if self._explicit_default:
+            return _RANK_EXPLICIT_DEFAULT
+        return _RANK_IMPLICIT_DEFAULT
+
     def handle_parse_result(
         self, ctx: Context, opts: cabc.Mapping[str, t.Any], args: list[str]
     ) -> tuple[t.Any, list[str]]:
         """Resolve, process and store this parameter's value."""
+        previous_source = ctx.get_parameter_source(self.name)  # type: ignore[arg-type]
+
         with augment_usage_errors(ctx, param=self):
             value, source = self.consume_value(ctx, opts)
 
@@ -1502,11 +1691,12 @@ class Parameter:
                     "{extra_message}"
                 ).format(
                     param_type=self.param_type_name,
-                    name=self.human_readable_name,
+                    name=self.spec,
                     extra_message=extra,
                 )
                 echo(style(message, fg="red"), err=True)
 
+            # Made available early so that types and callbacks can see it.
             ctx.set_parameter_source(self.name, source)  # type: ignore[arg-type]
 
             try:
@@ -1517,8 +1707,36 @@ class Parameter:
                 value = None
 
         if self.expose_value:
-            ctx.params[self.name] = value  # type: ignore[index]
+            self._store(ctx, value, source, previous_source)
         return value, args
+
+    def _store(
+        self,
+        ctx: Context,
+        value: t.Any,
+        source: ParameterSource,
+        previous_source: ParameterSource | None,
+    ) -> None:
+        """Put the value into ``ctx.params`` unless another parameter with
+        the same name already provided a stronger one.
+        """
+        name = t.cast(str, self.name)
+        rank = self._rank(source, value)
+        ranks = ctx._param_ranks
+
+        if name in ctx.params:
+            if name in ranks:
+                if rank < ranks[name]:
+                    if previous_source is not None:
+                        ctx.set_parameter_source(name, previous_source)
+                    return
+            elif rank < _RANK_ENVIRONMENT:
+                # Set by user code, e.g. an eager callback; only explicit
+                # user input replaces it.
+                return
+
+        ctx.params[name] = value
+        ranks[name] = rank
 
     def get_help_record(self, ctx: Context) -> tuple[str, str] | None:
         return None
@@ -1528,7 +1746,7 @@ class Parameter:
 
     def get_error_hint(self, ctx: Context) -> str:
         """How the parameter is named in error messages."""
-        names = self.opts or [self.human_readable_name]
+        names = self.opts or [self.spec]
         return " / ".join(f"'{name}'" for name in names)
 
     def shell_complete(self, ctx: Context, incomplete: str) -> list[CompletionItem]:
@@ -1543,6 +1761,16 @@ class Parameter:
                 results = [CompletionItem(c) for c in results]
             return t.cast("list[CompletionItem]", results)
         return self.type.shell_complete(ctx, self, incomplete)
+
+
+def _flag_value_type(flag_value: t.Any) -> types.ParamType:
+    """Type for a flag without an explicit one. Basic values get their own
+    type; anything else passes through unchanged.
+    """
+    simple = {bool: types.BOOL, int: types.INT, float: types.FLOAT, str: types.STRING}
+    if flag_value is None:
+        return types.STRING
+    return simple.get(type(flag_value), types.UNPROCESSED)
 
 
 class Option(Parameter):
@@ -1580,7 +1808,7 @@ class Option(Parameter):
         prompt_required: bool = True,
         hide_input: bool = False,
         is_flag: bool | None = None,
-        flag_value: t.Any | None = None,
+        flag_value: t.Any = UNSET,
         multiple: bool = False,
         count: bool = False,
         allow_from_autoenv: bool = True,
@@ -1595,13 +1823,12 @@ class Option(Parameter):
         if help:
             help = inspect.cleandoc(help)
 
-        default_given = "default" in attrs
         super().__init__(
             param_decls, type=type, multiple=multiple, deprecated=deprecated, **attrs
         )
 
         if prompt is True:
-            if self.name is None:
+            if not self.name:
                 raise TypeError("'name' is required with 'prompt=True'.")
             prompt_text: str | None = self.name.replace("_", " ").capitalize()
         elif prompt is False:
@@ -1611,7 +1838,7 @@ class Option(Parameter):
 
         if deprecated:
             note = _deprecated_note(deprecated)
-            help = f"{help} {note}" if help is not None else note
+            help = f"{help} {note}" if help else note
 
         self.prompt = prompt_text
         self.confirmation_prompt = confirmation_prompt
@@ -1623,8 +1850,9 @@ class Option(Parameter):
         # given without a value: ``--name`` prompts, ``--name x`` does not.
         self._flag_needs_value = self.prompt is not None and not self.prompt_required
 
+        has_flag_value = flag_value is not UNSET
         if is_flag is None:
-            if flag_value is not None:
+            if has_flag_value:
                 is_flag = True
             elif self._flag_needs_value:
                 is_flag = False
@@ -1633,28 +1861,34 @@ class Option(Parameter):
         elif is_flag is False and not self._flag_needs_value:
             # ``is_flag=False`` with a ``flag_value`` makes the value
             # optional: given alone, the option stores ``flag_value``.
-            self._flag_needs_value = flag_value is not None
+            self._flag_needs_value = has_flag_value
 
-        if is_flag and not default_given and not self.required:
-            self.default = () if multiple else False
-
-        if is_flag and flag_value is None:
-            flag_value = not self.default
+        if is_flag and not has_flag_value:
+            flag_value = True
 
         if is_flag and type is None:
-            self.type = types.convert_type(None, flag_value)
+            self.type = _flag_value_type(flag_value)
 
         self.is_flag: bool = bool(is_flag)
         self.is_bool_flag: bool = self.is_flag and isinstance(
             self.type, types.BoolParamType
         )
-        self.flag_value: t.Any = flag_value
+        self.flag_value: t.Any = None if flag_value is UNSET else flag_value
+
+        # A boolean flag that is not given is off, unless told otherwise.
+        if (
+            self.is_bool_flag
+            and self.default is UNSET
+            and not self.required
+            and not multiple
+        ):
+            self.default = False
 
         self.count = count
         if count:
             if type is None:
                 self.type = types.IntRange(min=0)
-            if not default_given:
+            if self.default is UNSET:
                 self.default = 0
 
         self.allow_from_autoenv = allow_from_autoenv
@@ -1694,23 +1928,20 @@ class Option(Parameter):
         )
         return info
 
-    def get_error_hint(self, ctx: Context) -> str:
-        names = self.opts or [self.human_readable_name]
-        return " / ".join(f"'{name}'" for name in names)
-
     def _parse_decls(
         self, decls: cabc.Sequence[str], expose_value: bool
     ) -> tuple[str | None, list[str], list[str]]:
         opts: list[str] = []
         secondary_opts: list[str] = []
-        name: str | None = None
-        candidates: list[tuple[str, str]] = []
+        explicit: str | None = None
+        # (prefix length, name part, declaration) of each primary option.
+        candidates: list[tuple[int, str, str]] = []
 
         for decl in decls:
             if decl.isidentifier():
-                if name is not None:
-                    raise TypeError(f"Name '{name}' defined twice")
-                name = decl
+                if explicit is not None:
+                    raise TypeError(f"Name '{explicit}' defined twice")
+                explicit = decl
                 continue
 
             # ``--flag/--no-flag`` declares an on and an off switch. If the
@@ -1720,7 +1951,8 @@ class Option(Parameter):
                 first, second = decl.split(sep, 1)
                 first = first.rstrip()
                 if first:
-                    candidates.append(_split_opt(first))
+                    prefix, rest = _split_opt(first)
+                    candidates.append((len(prefix), rest, first))
                     opts.append(first)
                 second = second.lstrip()
                 if second:
@@ -1731,20 +1963,49 @@ class Option(Parameter):
                         " same flag for true/false."
                     )
             else:
-                candidates.append(_split_opt(decl))
+                prefix, rest = _split_opt(decl)
+                candidates.append((len(prefix), rest, decl))
                 opts.append(decl)
 
-        if name is None and candidates:
-            # Prefer the name of the option with the longest prefix, so
-            # ``-f, --foo`` is named ``foo``.
-            candidates.sort(key=lambda c: -len(c[0]))
-            name = candidates[0][1].replace("-", "_").lower()
+        # The option with the longest prefix names the parameter, so
+        # ``-f, --foo`` is named ``foo``. Ties go to the first declared.
+        best = max(candidates, key=lambda c: c[0], default=None)
+        self._spec: str | None = best[2] if best is not None else None
+
+        name: str | None
+        if explicit is not None:
+            name = explicit
+            if name != name.lower():
+                import warnings
+
+                warnings.warn(
+                    f"The explicit name {name!r} is kept as written, but Click"
+                    " 9.0 lower cases an explicit name like it does a name"
+                    f" derived from an option. Use {name.lower()!r} instead.",
+                    DeprecationWarning,
+                    stacklevel=3,
+                )
+            else:
+                _warn_about_name(name, "option")
+        elif best is not None:
+            name = _transform_name(best[1])
             if not name.isidentifier():
-                name = None
+                if expose_value:
+                    raise TypeError(
+                        "Could not determine name for option with"
+                        f" declarations {decls!r}"
+                    )
+                _warn_about_name(name, "option")
+                name = ""
+            else:
+                _warn_about_name(name, "option")
+        else:
+            name = None
 
         if name is None:
             if not expose_value:
-                return None, opts, secondary_opts
+                _warn_about_name("", "option")
+                return "", opts, secondary_opts
             raise TypeError(
                 f"Could not determine name for option with declarations {decls!r}"
             )
@@ -1793,10 +2054,20 @@ class Option(Parameter):
                 const=self.flag_value,
             )
 
-    def get_help_record(self, ctx: Context) -> tuple[str, str] | None:
-        if self.hidden:
-            return None
+    @property
+    def spec(self) -> str:
+        """The option string the name was derived from, such as ``--times``
+        for ``-t, --times``.
+        """
+        return self._spec or self.name or ""
 
+    def get_help_spec(self, ctx: Context) -> str:
+        """The option names as shown in the help page, including the value
+        placeholder.
+        """
+        return self._help_names(ctx)[0]
+
+    def _help_names(self, ctx: Context) -> tuple[str, bool]:
         uses_slash = False
 
         def render(opts: cabc.Sequence[str]) -> str:
@@ -1810,7 +2081,13 @@ class Option(Parameter):
         names = [render(self.opts)]
         if self.secondary_opts:
             names.append(render(self.secondary_opts))
+        return ("; " if uses_slash else " / ").join(names), uses_slash
 
+    def get_help_record(self, ctx: Context) -> tuple[str, str] | None:
+        if self.hidden:
+            return None
+
+        spec = self.get_help_spec(ctx)
         help = self.help or ""
         extra = self.get_help_extra(ctx)
         items = []
@@ -1827,7 +2104,21 @@ class Option(Parameter):
             joined = "; ".join(items)
             help = f"{help}  [{joined}]" if help else f"[{joined}]"
 
-        return ("; " if uses_slash else " / ").join(names), help
+        return spec, help
+
+    def _envvar_names(self, ctx: Context) -> tuple[str, ...]:
+        """The environment variables this option reads, for display."""
+        envvar = self.envvar
+        if (
+            envvar is None
+            and self.allow_from_autoenv
+            and ctx.auto_envvar_prefix is not None
+            and self.name
+        ):
+            envvar = f"{ctx.auto_envvar_prefix}_{self.name.upper()}"
+        if envvar is None:
+            return ()
+        return (envvar,) if isinstance(envvar, str) else tuple(envvar)
 
     def get_help_extra(self, ctx: Context) -> types.OptionHelpExtra:
         """The bracketed details shown after the help text: environment
@@ -1836,16 +2127,9 @@ class Option(Parameter):
         extra: types.OptionHelpExtra = {}
 
         if self.show_envvar:
-            envvar = self.envvar
-            if (
-                envvar is None
-                and self.allow_from_autoenv
-                and ctx.auto_envvar_prefix is not None
-                and self.name is not None
-            ):
-                envvar = f"{ctx.auto_envvar_prefix}_{self.name.upper()}"
-            if envvar is not None:
-                extra["envvars"] = (envvar,) if isinstance(envvar, str) else tuple(envvar)
+            envvars = self._envvar_names(ctx)
+            if envvars:
+                extra["envvars"] = envvars
 
         # Looking up the default must not fail while rendering help.
         resilient = ctx.resilient_parsing
@@ -1859,8 +2143,9 @@ class Option(Parameter):
         if show_default is None:
             show_default = ctx.show_default
         custom_text = isinstance(show_default, str)
+        has_default = default_value is not None and default_value is not UNSET
 
-        if custom_text or (show_default and default_value is not None):
+        if custom_text or (show_default and has_default):
             if custom_text:
                 text = f"({show_default})"
             elif isinstance(default_value, (list, tuple)):
@@ -1875,7 +2160,7 @@ class Option(Parameter):
                 text = _split_opt(side[0])[1]
             elif self.is_bool_flag and not self.secondary_opts and not default_value:
                 text = ""
-            elif default_value == "":
+            elif isinstance(default_value, str) and default_value == "":
                 text = '""'
             else:
                 text = str(default_value)
@@ -1906,19 +2191,24 @@ class Option(Parameter):
     def get_default(
         self, ctx: Context, call: bool = True
     ) -> t.Any | t.Callable[[], t.Any] | None:
-        # Several non-boolean flags may share one name (feature switches).
-        # The one marked with a default provides its flag value.
-        if self.is_flag and not self.is_bool_flag:
-            for param in ctx.command.params:
-                if param.name == self.name and param.default:
-                    return t.cast(Option, param).flag_value
-            return None
-        return super().get_default(ctx, call=call)
+        value = self._lookup_default_map(ctx, call=False)
+        if value is UNSET:
+            value = self.default
+            # For a flag with a custom value, ``default=True`` means "on by
+            # default", so the flag value is the default. It is returned as
+            # is, even if callable.
+            if value is True and self.is_flag and not self.is_bool_flag:
+                return self.flag_value
+        if call and callable(value):
+            value = value()
+        return value
 
     def prompt_for_value(self, ctx: Context) -> t.Any:
         """Ask the user for the value."""
         assert self.prompt is not None
         default = self.get_default(ctx)
+        if default is UNSET:
+            default = None
 
         if self.is_bool_flag:
             return confirm(self.prompt, default)
@@ -1940,7 +2230,7 @@ class Option(Parameter):
         if (
             self.allow_from_autoenv
             and ctx.auto_envvar_prefix is not None
-            and self.name is not None
+            and self.name
         ):
             rv = os.environ.get(f"{ctx.auto_envvar_prefix}_{self.name.upper()}")
             if rv:
@@ -1951,6 +2241,22 @@ class Option(Parameter):
         rv: t.Any | None = self.resolve_envvar_value(ctx)
         if rv is None:
             return None
+
+        if self.is_flag and not self.is_bool_flag:
+            # The variable either names the flag value exactly, or switches
+            # the flag on or off with a boolean word.
+            if rv == self.flag_value:
+                return self.flag_value
+            word = rv.strip().lower()
+            if word in types._TRUE_WORDS:
+                return self.flag_value
+            if word in types._FALSE_WORDS:
+                return False
+            return None
+
+        if self.is_bool_flag and not rv.strip():
+            return None
+
         if self.nargs != 1 or self.multiple:
             rv = self.type.split_envvar_value(rv)
             if self.multiple and self.nargs != 1:
@@ -1971,13 +2277,13 @@ class Option(Parameter):
                 value = self.flag_value
         elif (
             self.multiple
-            and value is not None
+            and isinstance(value, (list, tuple))
             and any(v is _flag_needs_value for v in value)
         ):
             value = [self.flag_value if v is _flag_needs_value else v for v in value]
             source = ParameterSource.COMMANDLINE
         elif (
-            source in {None, ParameterSource.DEFAULT}
+            source is ParameterSource.DEFAULT
             and self.prompt is not None
             and (self.required or self.prompt_required)
             and not ctx.resilient_parsing
@@ -1991,6 +2297,9 @@ class Option(Parameter):
 class Argument(Parameter):
     """A positional parameter. Arguments are required by default unless
     they have a default or take a variable number of values.
+
+    :param help: help text, shown in a "Positional arguments" section of
+        the help page.
     """
 
     param_type_name = "argument"
@@ -1999,10 +2308,11 @@ class Argument(Parameter):
         self,
         param_decls: cabc.Sequence[str],
         required: bool | None = None,
+        help: str | None = None,
         **attrs: t.Any,
     ) -> None:
         if required is None:
-            if attrs.get("default") is not None:
+            if attrs.get("default", UNSET) is not UNSET:
                 required = False
             else:
                 required = attrs.get("nargs", 1) > 0
@@ -2012,12 +2322,18 @@ class Argument(Parameter):
 
         super().__init__(param_decls, required=required, **attrs)
 
-        if __debug__:
-            if self.default is not None and self.nargs == -1:
-                raise TypeError("'default' is not supported for nargs=-1.")
+        if help:
+            help = inspect.cleandoc(help)
+        self.help = help
+
+    def to_info_dict(self) -> dict[str, t.Any]:
+        info = super().to_info_dict()
+        info["help"] = self.help
+        return info
 
     @property
-    def human_readable_name(self) -> str:
+    def spec(self) -> str:
+        """How the argument is named in help and errors."""
         if self.metavar is not None:
             return self.metavar
         return self.name.upper()  # type: ignore
@@ -2036,12 +2352,23 @@ class Argument(Parameter):
             var += "..."
         return var
 
+    def get_help_spec(self, ctx: Context) -> str:
+        return self.make_metavar(ctx)
+
+    def get_help_record(self, ctx: Context) -> tuple[str, str]:
+        help = self.help or ""
+        if self.deprecated:
+            note = _deprecated_note(self.deprecated)
+            help = f"{help} {note}" if help else note
+        return self.get_help_spec(ctx), help
+
     def _parse_decls(
         self, decls: cabc.Sequence[str], expose_value: bool
     ) -> tuple[str | None, list[str], list[str]]:
         if not decls:
             if not expose_value:
-                return None, [], []
+                _warn_about_name("", "argument")
+                return "", [], []
             raise TypeError("Argument is marked as exposed, but does not have a name.")
         if len(decls) != 1:
             raise TypeError(
@@ -2049,7 +2376,9 @@ class Argument(Parameter):
                 f" {len(decls)}: {decls}."
             )
         decl = decls[0]
-        return decl.replace("-", "_").lower(), [decl], []
+        name = _transform_name(decl)
+        _warn_about_name(name, "argument")
+        return name, [decl], []
 
     def get_usage_pieces(self, ctx: Context) -> list[str]:
         return [self.make_metavar(ctx)]
@@ -2082,4 +2411,4 @@ def __getattr__(name: str) -> object:
         )
         return _MultiCommand
 
-    raise AttributeError(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

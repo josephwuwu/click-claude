@@ -13,6 +13,7 @@ import typing as t
 from gettext import gettext as _
 from gettext import ngettext
 
+from ._utils import FLAG_NEEDS_VALUE
 from .exceptions import BadArgumentUsage
 from .exceptions import BadOptionUsage
 from .exceptions import NoSuchOption
@@ -27,16 +28,8 @@ if t.TYPE_CHECKING:
 V = t.TypeVar("V")
 
 
-class _FlagNeedsValue:
-    """Placeholder stored for an option with an optional value that was
-    given without one.
-    """
-
-    def __repr__(self) -> str:
-        return "<flag needs value>"
-
-
-_flag_needs_value: t.Any = _FlagNeedsValue()
+# Stored for an option with an optional value that was given without one.
+_flag_needs_value: t.Any = FLAG_NEEDS_VALUE
 
 
 def _split_opt(opt: str) -> tuple[str, str]:
@@ -155,6 +148,7 @@ class _Option:
             state.opts[dest] = state.opts.get(dest, 0) + 1  # type: ignore
         else:
             raise ValueError(f"unknown action '{self.action}'")
+        state.owners[dest] = self.obj  # type: ignore[index]
         state.order.append(self.obj)
 
 
@@ -177,11 +171,12 @@ class _Argument:
                     )
                 )
 
-        if self.nargs == -1 and self.obj.envvar is not None and value == ():
-            # Nothing on the command line; let the environment provide it.
-            value = None
-
-        state.opts[self.dest] = value  # type: ignore[index]
+        # Nothing given on the command line: leave the value unset so that
+        # the environment or a default can provide it.
+        given = value is not None and not (self.nargs == -1 and value == ())
+        if given:
+            state.opts[self.dest] = value  # type: ignore[index]
+            state.owners[self.dest] = self.obj  # type: ignore[index]
         state.order.append(self.obj)
 
 
@@ -191,6 +186,9 @@ class _ParsingState:
         self.largs: list[str] = []
         self.rargs = rargs
         self.order: list[CoreParameter] = []
+        #: The parameter that provided the final value for each destination.
+        #: Several options may share a destination.
+        self.owners: dict[str, CoreParameter] = {}
 
 
 class _OptionParser:
@@ -212,6 +210,7 @@ class _OptionParser:
         self._long_opt: dict[str, _Option] = {}
         self._opt_prefixes = {"-", "--"}
         self._args: list[_Argument] = []
+        self._owners: dict[str, CoreParameter] = {}
 
     def add_option(
         self,
@@ -240,6 +239,7 @@ class _OptionParser:
         unused arguments, and the parameters in the order they were seen.
         """
         state = _ParsingState(args)
+        self._owners = state.owners
         try:
             self._scan_options(state)
             self._assign_arguments(state)
@@ -402,4 +402,4 @@ def __getattr__(name: str) -> object:
         )
         return split_arg_string
 
-    raise AttributeError(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

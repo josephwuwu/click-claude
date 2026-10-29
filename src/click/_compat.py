@@ -15,13 +15,15 @@ import typing as t
 WIN = sys.platform.startswith("win")
 CYGWIN = sys.platform.startswith("cygwin")
 
-# Matches CSI escape sequences (colors, cursor movement) and OSC sequences.
-_ANSI_RE = re.compile(r"\033(?:\[[;?0-9]*[a-zA-Z]|\][^\007\033]*(?:\007|\033\\))")
+# A complete CSI escape sequence: ESC, "[", parameter bytes, intermediate
+# bytes, and one final byte. This covers colors (including colon separated
+# true color), cursor movement, private modes and mouse reports.
+_ansi_re = re.compile(r"\033\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]")
 
 
 def strip_ansi(value: str) -> str:
     """Remove ANSI escape sequences from ``value``."""
-    return _ANSI_RE.sub("", value)
+    return _ansi_re.sub("", value)
 
 
 def term_len(value: str) -> int:
@@ -46,16 +48,19 @@ def isatty(stream: t.Any) -> bool:
 def should_strip_ansi(stream: t.Any = None, color: bool | None = None) -> bool:
     """Decide whether styling should be removed before writing to
     ``stream``. An explicit ``color`` always wins; otherwise styling is
-    kept only for interactive terminals.
+    kept for terminals and Jupyter notebooks.
     """
     if color is not None:
         return not color
     if stream is None:
         stream = sys.stdin
-    return not _stream_is_tty(stream) and not _is_jupyter_stream(stream)
+    return not isatty(stream) and not _is_jupyter_kernel_output(stream)
 
 
-def _is_jupyter_stream(stream: t.Any) -> bool:
+def _is_jupyter_kernel_output(stream: t.Any) -> bool:
+    """Whether ``stream`` is the output of a Jupyter kernel, which renders
+    styling although it is not a terminal.
+    """
     module = type(stream).__module__ or ""
     return module.startswith("ipykernel.")
 

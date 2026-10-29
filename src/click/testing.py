@@ -415,7 +415,20 @@ class CliRunner:
     ) -> cabc.Iterator[str]:
         """Change into a new temporary directory for the duration of the
         block. It is deleted afterwards unless ``temp_dir`` was given.
+
+        Deprecated: changing the working directory affects the whole
+        process and is not thread safe. Create a temporary directory and
+        pass absolute paths instead.
         """
+        import warnings
+
+        warnings.warn(
+            "'isolated_filesystem' is deprecated and will be removed in Click"
+            " 9.0. Create a temporary directory, for example with pytest's"
+            " 'tmp_path', and pass absolute paths instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
         cwd = os.getcwd()
         path = tempfile.mkdtemp(dir=temp_dir)
         os.chdir(path)

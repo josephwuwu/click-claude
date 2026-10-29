@@ -41,7 +41,9 @@ def shell_complete(
 
     comp = comp_cls(cli, ctx_args, prog_name, complete_var)
     if action == "source":
-        echo(comp.source())
+        # Written as bytes so that the script keeps LF line endings even
+        # where the text stream would translate them.
+        echo(comp.source().encode("utf-8"))
         return 0
     if action == "complete":
         echo(comp.complete())
@@ -179,6 +181,62 @@ end
 
 complete --no-files --command %(prog_name)s --arguments \
 "(%(complete_func)s)"
+"""
+
+
+_POWERSHELL_SOURCE = """\
+Register-ArgumentCompleter -Native -CommandName %(prog_name)s -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    $line = $commandAst.ToString()
+    if ($cursorPosition -lt $line.Length) {
+        $line = $line.Substring(0, $cursorPosition)
+    }
+    $before = @($commandAst.CommandElements | Where-Object {
+        $_.Extent.StartOffset -lt $cursorPosition
+    })
+    $index = $before.Count
+    if ($wordToComplete -ne '') {
+        $index -= 1
+    }
+
+    $env:COMP_WORDS = $line
+    $env:COMP_CWORD = $index
+    $env:%(complete_var)s = 'powershell_complete'
+    try {
+        $response = @(& %(prog_name)s)
+    } finally {
+        Remove-Item Env:COMP_WORDS, Env:COMP_CWORD, Env:%(complete_var)s
+    }
+
+    for ($i = 0; $i + 2 -lt $response.Count; $i += 3) {
+        $kind = $response[$i]
+        $value = $response[$i + 1]
+        $description = $response[$i + 2]
+        if ($description -eq '_') {
+            $description = $value
+        }
+
+        switch ($kind) {
+            'plain' {
+                [System.Management.Automation.CompletionResult]::new(
+                    $value, $value, 'ParameterValue', $description)
+            }
+            'dir' {
+                Get-ChildItem -Directory -Path "$value*" | ForEach-Object {
+                    [System.Management.Automation.CompletionResult]::new(
+                        $_.FullName, $_.Name, 'ProviderContainer', $_.Name)
+                }
+            }
+            'file' {
+                Get-ChildItem -Path "$value*" | ForEach-Object {
+                    [System.Management.Automation.CompletionResult]::new(
+                        $_.FullName, $_.Name, 'ProviderItem', $_.Name)
+                }
+            }
+        }
+    }
+}
 """
 
 
@@ -332,8 +390,30 @@ class FishComplete(ShellComplete):
 
     def format_completion(self, item: CompletionItem) -> str:
         if item.help:
-            return f"{item.type},{item.value}\t{item.help}"
+            # One completion per line: escape line breaks, and tabs are
+            # the separator between value and help.
+            help = item.help.replace("\n", "\\n").replace("\t", " ")
+            return f"{item.type},{item.value}\t{help}"
         return f"{item.type},{item.value}"
+
+
+class PowerShellComplete(ShellComplete):
+    name = "powershell"
+    source_template = _POWERSHELL_SOURCE
+
+    def get_completion_args(self) -> tuple[list[str], str]:
+        words = split_arg_string(os.environ["COMP_WORDS"])
+        index = int(os.environ["COMP_CWORD"])
+        args = words[1:index]
+        incomplete = words[index] if index < len(words) else ""
+        return args, incomplete
+
+    def format_completion(self, item: CompletionItem) -> str:
+        # Each item is three lines: kind, value, help ("_" for none). The
+        # help must therefore stay on one line.
+        help = item.help or "_"
+        help = help.replace("\r", " ").replace("\n", " ")
+        return f"{item.type}\n{item.value}\n{help}"
 
 
 ShellCompleteType = t.TypeVar("ShellCompleteType", bound="type[ShellComplete]")
@@ -341,6 +421,7 @@ ShellCompleteType = t.TypeVar("ShellCompleteType", bound="type[ShellComplete]")
 _available_shells: dict[str, type[ShellComplete]] = {
     "bash": BashComplete,
     "fish": FishComplete,
+    "powershell": PowerShellComplete,
     "zsh": ZshComplete,
 }
 

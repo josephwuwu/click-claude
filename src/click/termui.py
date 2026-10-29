@@ -21,7 +21,7 @@ from .globals import resolve_color_default
 from .types import Choice
 from .types import ParamType
 from .types import convert_type
-from .utils import LazyFile
+from .utils import _LazyFile
 from .utils import echo
 
 if t.TYPE_CHECKING:
@@ -78,19 +78,35 @@ def _build_prompt(
 
 
 def _format_default(default: t.Any) -> t.Any:
-    if isinstance(default, (io.IOBase, LazyFile)) and hasattr(default, "name"):
+    if isinstance(default, (io.IOBase, _LazyFile)) and hasattr(default, "name"):
         return default.name
     return default
+
+
+def _ask(reader: t.Callable[[str], str], prompt_text: str, err: bool) -> str:
+    """Show ``prompt_text`` and read a line with ``reader``.
+
+    The prompt goes through :func:`echo`, so it is styled and routed like
+    other output. A trailing space is left to the input function instead:
+    readline would otherwise erase the whole prompt on backspace. With
+    ``err``, anything the input function writes goes to stderr too.
+    """
+    head, tail = prompt_text, ""
+    if prompt_text.endswith(" "):
+        head, tail = prompt_text[:-1], " "
+    echo(head, nl=False, err=err)
+    if not err:
+        return reader(tail)
+    from contextlib import redirect_stdout
+
+    with redirect_stdout(sys.stderr):
+        return reader(tail)
 
 
 def _read_line(prompt_text: str, hidden: bool, err: bool) -> str:
     reader = hidden_prompt_func if hidden else visible_prompt_func
     try:
-        # The prompt goes through echo so it respects ``err``; the input
-        # function only gets a single space. That keeps readline from
-        # erasing the whole prompt on backspace.
-        echo(prompt_text.rstrip(" "), nl=False, err=err)
-        return reader(" ")
+        return _ask(reader, prompt_text, err)
     except (KeyboardInterrupt, EOFError):
         # getpass does not end the line when interrupted.
         if hidden:
@@ -192,8 +208,7 @@ def confirm(
 
     while True:
         try:
-            echo(question.rstrip(" "), nl=False, err=err)
-            answer = visible_prompt_func(" ").lower().strip()
+            answer = _ask(visible_prompt_func, question, err).lower().strip()
         except (KeyboardInterrupt, EOFError):
             raise Abort() from None
 

@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import collections.abc as cabc
-import textwrap
 from contextlib import contextmanager
 from gettext import gettext as _
 
 from ._compat import term_len
+from ._textwrap import new_wrapper
 from .parser import _split_opt
 
 #: When set, every :class:`HelpFormatter` uses this width instead of looking
@@ -34,29 +34,6 @@ def iter_rows(
     """Yield each row padded with empty cells to ``col_count`` columns."""
     for row in rows:
         yield tuple(row) + ("",) * (col_count - len(row))
-
-
-class _Wrapper(textwrap.TextWrapper):
-    """A text wrapper that can add indentation temporarily and indent lines
-    without re-wrapping them.
-    """
-
-    @contextmanager
-    def extra_indent(self, extra: str) -> cabc.Iterator[None]:
-        saved = (self.initial_indent, self.subsequent_indent)
-        self.initial_indent += extra
-        self.subsequent_indent += extra
-        try:
-            yield
-        finally:
-            self.initial_indent, self.subsequent_indent = saved
-
-    def indent_only(self, text: str) -> str:
-        out = []
-        for idx, line in enumerate(text.splitlines()):
-            prefix = self.initial_indent if idx == 0 else self.subsequent_indent
-            out.append(f"{prefix}{line}")
-        return "\n".join(out)
 
 
 def _paragraphs(text: str) -> list[tuple[int, bool, str]]:
@@ -105,8 +82,8 @@ def wrap_text(
     with a line containing only ``\\b`` are left exactly as written.
     """
     text = text.expandtabs()
-    wrapper = _Wrapper(
-        width,
+    wrapper = new_wrapper(
+        width=width,
         initial_indent=initial_indent,
         subsequent_indent=subsequent_indent,
         replace_whitespace=False,
@@ -165,6 +142,10 @@ class HelpFormatter:
         """
         if prefix is None:
             prefix = f"{_('Usage:')} "
+
+        if not args:
+            self.write(f"{prefix:>{self.current_indent}}{prog}\n")
+            return
 
         lead = f"{prefix:>{self.current_indent}}{prog} "
         avail = self.width - self.current_indent

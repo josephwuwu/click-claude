@@ -65,13 +65,23 @@ from .types import UUID as UUID
 from .utils import echo as echo
 from .utils import format_filename as format_filename
 from .utils import get_app_dir as get_app_dir
-from .utils import get_binary_stream as get_binary_stream
-from .utils import get_text_stream as get_text_stream
 from .utils import open_file as open_file
 
 
 def __getattr__(name: str) -> object:
     import warnings
+
+    if name in ("get_binary_stream", "get_text_stream"):
+        from . import utils
+
+        warnings.warn(
+            f"'{name}' is deprecated and will be removed in Click 9.0. Use"
+            " 'sys.stdin', 'sys.stdout' and 'sys.stderr' or their 'buffer'"
+            " attribute instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return getattr(utils, f"_{name}")
 
     if name == "BaseCommand":
         from .core import _BaseCommand
@@ -118,4 +128,4 @@ def __getattr__(name: str) -> object:
         )
         return importlib.metadata.version("click")
 
-    raise AttributeError(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

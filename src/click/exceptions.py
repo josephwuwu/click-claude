@@ -27,6 +27,19 @@ def _join_param_hints(hint: t.Sequence[str] | str | None) -> str | None:
     return hint
 
 
+def _suggestion(possibilities: t.Sequence[str] | None) -> str:
+    """``Did you mean ...?`` text for close matches of a mistyped name."""
+    if not possibilities:
+        return ""
+    choices = sorted(possibilities)
+    listing = ", ".join(repr(c) for c in choices)
+    return ngettext(
+        "Did you mean {possibility}?",
+        "(Did you mean one of: {possibilities}?)",
+        len(choices),
+    ).format(possibility=listing, possibilities=listing)
+
+
 class ClickException(Exception):
     """Base for errors that are meant to be shown to the user. Exiting with
     one of these prints ``Error: <message>`` and uses :attr:`exit_code`.
@@ -180,20 +193,15 @@ class NoSuchOption(UsageError):
         ctx: Context | None = None,
     ) -> None:
         if message is None:
-            message = _("No such option: {name}").format(name=option_name)
+            message = _("No such option {name!r}.").format(name=option_name)
         super().__init__(message, ctx)
         self.option_name = option_name
         self.possibilities = possibilities
 
     def format_message(self) -> str:
-        if not self.possibilities:
+        suggestion = _suggestion(self.possibilities)
+        if not suggestion:
             return self.message
-        choices = sorted(self.possibilities)
-        suggestion = ngettext(
-            "Did you mean {possibility}?",
-            "(Possible options: {possibilities})",
-            len(choices),
-        ).format(possibility=choices[0], possibilities=", ".join(choices))
         return f"{self.message} {suggestion}"
 
 
