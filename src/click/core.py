@@ -274,11 +274,9 @@ class Context:
         self._close_callbacks: list[t.Callable[[], t.Any]] = []
         self._depth = 0
         self._parameter_source: dict[str, ParameterSource] = {}
-        # Bookkeeping for parameters that share a name: how strong the
-        # stored value is, and which parameter used the name on the
-        # command line.
+        # For parameters that share a name: how strongly the stored value
+        # claims the name.
         self._param_ranks: dict[str, int] = {}
-        self._param_owners: dict[str, Parameter] = {}
         self._exit_stack = ExitStack()
 
     @property
@@ -505,6 +503,11 @@ class Context:
         return self._parameter_source.get(name)
 
 
+#: The name the automatic help option is stored under, chosen so that it
+#: does not collide with user parameters such as one named ``help``.
+_HELP_OPTION_NAME = "_click_default_help"
+
+
 def _warn_about_shared_names(params: cabc.Sequence[Parameter]) -> None:
     """Warn about option strings declared twice, and about arguments whose
     name another parameter also uses. Options sharing a name on purpose,
@@ -518,6 +521,14 @@ def _warn_about_shared_names(params: cabc.Sequence[Parameter]) -> None:
             warnings.warn(
                 f"The parameter {opt} is used more than once. Remove its"
                 " duplicate as parameters should be unique.",
+                stacklevel=4,
+            )
+
+    for param in params:
+        if param.name == _HELP_OPTION_NAME and param.expose_value:
+            warnings.warn(
+                f"The parameter name {_HELP_OPTION_NAME!r} is reserved for the"
+                " automatic help option. Rename the parameter.",
                 stacklevel=4,
             )
 
@@ -656,7 +667,7 @@ class Command:
                 ctx.exit()
 
             self._help_option = Option(
-                names,
+                [*names, _HELP_OPTION_NAME],
                 is_flag=True,
                 is_eager=True,
                 expose_value=False,
@@ -765,7 +776,6 @@ class Command:
 
         parser = self.make_parser(ctx)
         opts, args, order = parser.parse_args(args=args)
-        ctx._param_owners = dict(parser._owners)
 
         for param in iter_params_for_processing(order, self.get_params(ctx)):
             _, args = param.handle_parse_result(ctx, opts, args)
@@ -1527,13 +1537,7 @@ class Parameter:
         """Find the raw value: command line, then environment, then
         ``default_map``, then the default.
         """
-        value = UNSET
-        if self.name in opts:
-            owners = getattr(ctx, "_param_owners", {})
-            # Several parameters may share a name; only the one that was
-            # actually used on the command line takes the value.
-            if owners.get(self.name, self) is self:  # type: ignore[arg-type]
-                value = opts[self.name]  # type: ignore[index]
+        value = opts.get(self.name, UNSET)  # type: ignore[arg-type]
         source = ParameterSource.COMMANDLINE
 
         if value is UNSET:
@@ -2351,7 +2355,8 @@ class Argument(Parameter):
             var = self.name.upper()  # type: ignore
         if self.deprecated:
             var += "!"
-        if not self.required:
+        # A type metavar in brackets already reads as optional.
+        if not self.required and not (var.startswith("[") and var.endswith("]")):
             var = f"[{var}]"
         if self.nargs != 1:
             var += "..."

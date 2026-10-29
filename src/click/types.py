@@ -222,14 +222,14 @@ class Choice(ParamType[ParamTypeValue]):
             names = [convert_type(type(c)).name.upper() for c in self.choices]
             body = "|".join(dict.fromkeys(names))
         else:
-            body = "|".join(self._label(c) for c in self.choices)
+            body = "|".join(self._normalized_mapping(ctx).values())
 
         if param.param_type_name == "argument" and param.required:
             return f"{{{body}}}"
         return f"[{body}]"
 
     def get_missing_message(self, param: Parameter, ctx: Context | None) -> str:
-        listing = ",\n\t".join(self._label(c) for c in self.choices)
+        listing = ",\n\t".join(self._normalized_mapping(ctx).values())
         return _("Choose from:\n\t{choices}").format(choices=listing)
 
     def convert(
@@ -242,7 +242,7 @@ class Choice(ParamType[ParamTypeValue]):
         self.fail(self.get_invalid_choice_message(value, ctx), param, ctx)
 
     def get_invalid_choice_message(self, value: t.Any, ctx: Context | None) -> str:
-        listing = ", ".join(repr(self._label(c)) for c in self.choices)
+        listing = ", ".join(repr(c) for c in self._normalized_mapping(ctx).values())
         return ngettext(
             "{value!r} is not {choice}.",
             "{value!r} is not one of {choices}.",

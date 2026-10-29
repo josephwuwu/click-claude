@@ -148,7 +148,6 @@ class _Option:
             state.opts[dest] = state.opts.get(dest, 0) + 1  # type: ignore
         else:
             raise ValueError(f"unknown action '{self.action}'")
-        state.owners[dest] = self.obj  # type: ignore[index]
         state.order.append(self.obj)
 
 
@@ -176,7 +175,6 @@ class _Argument:
         given = value is not None and not (self.nargs == -1 and value == ())
         if given:
             state.opts[self.dest] = value  # type: ignore[index]
-            state.owners[self.dest] = self.obj  # type: ignore[index]
         state.order.append(self.obj)
 
 
@@ -186,9 +184,6 @@ class _ParsingState:
         self.largs: list[str] = []
         self.rargs = rargs
         self.order: list[CoreParameter] = []
-        #: The parameter that provided the final value for each destination.
-        #: Several options may share a destination.
-        self.owners: dict[str, CoreParameter] = {}
 
 
 class _OptionParser:
@@ -210,7 +205,6 @@ class _OptionParser:
         self._long_opt: dict[str, _Option] = {}
         self._opt_prefixes = {"-", "--"}
         self._args: list[_Argument] = []
-        self._owners: dict[str, CoreParameter] = {}
 
     def add_option(
         self,
@@ -239,7 +233,6 @@ class _OptionParser:
         unused arguments, and the parameters in the order they were seen.
         """
         state = _ParsingState(args)
-        self._owners = state.owners
         try:
             self._scan_options(state)
             self._assign_arguments(state)

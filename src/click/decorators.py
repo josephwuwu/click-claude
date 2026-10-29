@@ -357,15 +357,7 @@ def version_option(
             prog_name = ctx.find_root().info_name
 
         if version is None and package_name is not None:
-            import importlib.metadata
-
-            try:
-                version = importlib.metadata.version(package_name)
-            except importlib.metadata.PackageNotFoundError:
-                raise RuntimeError(
-                    f"{package_name!r} is not installed. Try passing"
-                    " 'package_name' instead."
-                ) from None
+            version = _installed_version(package_name)
 
         if version is None:
             raise RuntimeError(
@@ -376,6 +368,60 @@ def version_option(
             message % {"prog": prog_name, "package": package_name, "version": version},
             color=ctx.color,
         )
+        ctx.exit()
+
+    if not param_decls:
+        param_decls = ("--version",)
+
+    kwargs.setdefault("is_flag", True)
+    kwargs.setdefault("expose_value", False)
+    kwargs.setdefault("is_eager", True)
+    kwargs.setdefault("help", _("Show the version and exit."))
+    kwargs["callback"] = callback
+    return option(*param_decls, **kwargs)
+
+
+def _installed_version(package_name: str) -> str:
+    """The installed version of ``package_name``, which may be a
+    distribution name or an import name (like ``PIL`` for ``Pillow``).
+    """
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        pass
+
+    distributions = importlib.metadata.packages_distributions().get(package_name, [])
+    distributions = list(dict.fromkeys(distributions))
+    if len(distributions) == 1:
+        try:
+            return importlib.metadata.version(distributions[0])
+        except importlib.metadata.PackageNotFoundError:
+            pass
+    elif len(distributions) > 1:
+        raise RuntimeError(
+            f"{package_name!r} is provided by multiple installed distributions"
+            f" ({', '.join(distributions)}). Pass the distribution name as"
+            " 'package_name' instead."
+        )
+
+    raise RuntimeError(
+        f"{package_name!r} is not installed. Try passing 'package_name' instead."
+    )
+
+
+def custom_version_option(
+    message: t.Callable[[Context], str], *param_decls: str, **kwargs: t.Any
+) -> t.Callable[[FC], FC]:
+    """Add a ``--version`` flag that prints ``message(ctx)`` and exits.
+    Use this when the version text is not derived from package metadata.
+    """
+
+    def callback(ctx: Context, param: Parameter, value: bool) -> None:
+        if not value or ctx.resilient_parsing:
+            return
+        echo(message(ctx), color=ctx.color)
         ctx.exit()
 
     if not param_decls:

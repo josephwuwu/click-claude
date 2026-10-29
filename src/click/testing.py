@@ -105,11 +105,24 @@ class StreamMixer:
 
 class _NamedTextIOWrapper(io.TextIOWrapper):
     def __init__(
-        self, buffer: t.BinaryIO, name: str, mode: str, **kwargs: t.Any
+        self,
+        buffer: t.BinaryIO,
+        name: str,
+        mode: str,
+        fileno: int | None = None,
+        **kwargs: t.Any,
     ) -> None:
         super().__init__(buffer, **kwargs)
         self._name = name
         self._mode = mode
+        self._fileno = fileno
+
+    def fileno(self) -> int:
+        # With fd capture the descriptor is redirected too, so code that
+        # needs a real descriptor (like faulthandler) can have it.
+        if self._fileno is not None:
+            return self._fileno
+        return super().fileno()
 
     @property
     def name(self) -> str:
@@ -186,6 +199,67 @@ class Result:
         return f"<{type(self).__name__} {status}>"
 
 
+class _FdCapture:
+    """Redirects the process's file descriptors 1 and 2 into temporary
+    files, which catches output that bypasses ``sys.stdout`` and
+    ``sys.stderr``: writes to the descriptors, stale stream references,
+    subprocesses and C extensions.
+    """
+
+    def __init__(self) -> None:
+        self._saved: dict[int, int] = {}
+        self._files: dict[int, t.BinaryIO] = {}
+
+    def start(self) -> None:
+        for fd in (1, 2):
+            # Flush what is pending for the real descriptor first.
+            real = sys.__stdout__ if fd == 1 else sys.__stderr__
+            if real is not None:
+                with contextlib.suppress(Exception):
+                    real.flush()
+            self._files[fd] = t.cast(t.BinaryIO, tempfile.TemporaryFile())
+            self._saved[fd] = os.dup(fd)
+            os.dup2(self._files[fd].fileno(), fd)
+
+    def stop(self) -> tuple[bytes, bytes]:
+        captured = []
+        for fd in (1, 2):
+            saved = self._saved.get(fd)
+            if saved is not None:
+                os.dup2(saved, fd)
+                os.close(saved)
+            f = self._files.pop(fd)
+            f.seek(0)
+            captured.append(f.read())
+            f.close()
+        self._saved.clear()
+        return captured[0], captured[1]
+
+
+@contextlib.contextmanager
+def _real_streams_for_pdb() -> cabc.Iterator[None]:
+    """Make ``pdb.Pdb()`` talk to the terminal rather than the captured
+    streams, so that a breakpoint in a command under test is usable.
+    """
+    import pdb
+
+    original = pdb.Pdb.__init__
+
+    def init(self: t.Any, *args: t.Any, **kwargs: t.Any) -> None:
+        # Positional order: completekey, stdin, stdout.
+        if len(args) < 2:
+            kwargs.setdefault("stdin", sys.__stdin__)
+        if len(args) < 3:
+            kwargs.setdefault("stdout", sys.__stdout__)
+        original(self, *args, **kwargs)
+
+    pdb.Pdb.__init__ = init  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        pdb.Pdb.__init__ = original  # type: ignore[method-assign]
+
+
 class CliRunner:
     """Invoke commands in isolation for tests.
 
@@ -195,6 +269,10 @@ class CliRunner:
         typed text even where no prompt echoes it.
     :param catch_exceptions: catch exceptions other than ``SystemExit``
         and store them on the result.
+    :param capture: ``"sys"`` replaces ``sys.stdout`` and ``sys.stderr``.
+        ``"fd"`` also redirects the file descriptors 1 and 2, capturing
+        output written around the Python streams. Not available on
+        Windows.
     """
 
     def __init__(
@@ -203,11 +281,17 @@ class CliRunner:
         env: cabc.Mapping[str, str | None] | None = None,
         echo_stdin: bool = False,
         catch_exceptions: bool = True,
+        capture: t.Literal["sys", "fd"] = "sys",
     ) -> None:
+        if capture not in ("sys", "fd"):
+            raise ValueError(f"Invalid capture mode {capture!r}, use 'sys' or 'fd'.")
+        if capture == "fd" and sys.platform == "win32":
+            raise ValueError("capture='fd' is not supported on Windows.")
         self.charset = charset
         self.env: cabc.Mapping[str, str | None] = env or {}
         self.echo_stdin = echo_stdin
         self.catch_exceptions = catch_exceptions
+        self.capture = capture
 
     def get_default_prog_name(self, cli: Command) -> str:
         return cli.name or "root"
@@ -257,15 +341,21 @@ class CliRunner:
             # Echo input as soon as it is read.
             text_input._CHUNK_SIZE = 1  # type: ignore
 
-        sys.stdout = _NamedTextIOWrapper(
-            mixer.stdout, encoding=self.charset, name="<stdout>", mode="w"
+        fd_mode = self.capture == "fd"
+        sys.stdout = out_wrapper = _NamedTextIOWrapper(
+            mixer.stdout,
+            encoding=self.charset,
+            name="<stdout>",
+            mode="w",
+            fileno=1 if fd_mode else None,
         )
-        sys.stderr = _NamedTextIOWrapper(
+        sys.stderr = err_wrapper = _NamedTextIOWrapper(
             mixer.stderr,
             encoding=self.charset,
             name="<stderr>",
             mode="w",
             errors="backslashreplace",
+            fileno=2 if fd_mode else None,
         )
 
         def read_line() -> str:
@@ -289,7 +379,8 @@ class CliRunner:
                 return read_line()
 
         def read_char(echo: bool) -> str:
-            char = sys.stdin.read(1)
+            with _pause_echo(echo_input):
+                char = sys.stdin.read(1)
             if echo:
                 sys.stdout.write(char)
             sys.stdout.flush()
@@ -316,6 +407,7 @@ class CliRunner:
         _compat.should_strip_ansi = strip_unless_color
 
         saved_env = {}
+        fd_capture = _FdCapture() if fd_mode else None
         try:
             for key, value in env.items():
                 saved_env[key] = os.environ.get(key)
@@ -323,14 +415,33 @@ class CliRunner:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-            yield (mixer.stdout, mixer.stderr, mixer.output)
+            if fd_capture is not None:
+                fd_capture.start()
+            with _real_streams_for_pdb():
+                yield (mixer.stdout, mixer.stderr, mixer.output)
         finally:
+            if fd_capture is not None:
+                with contextlib.suppress(Exception):
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                fd_out, fd_err = fd_capture.stop()
+                # Descriptor output cannot be interleaved exactly with the
+                # Python level output, so it is appended.
+                mixer.stdout.write(fd_out)
+                mixer.stderr.write(fd_err)
             for key, value in saved_env.items():
                 if value is None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
             sys.stdin, sys.stdout, sys.stderr = saved_streams
+            # Release the buffers from the wrappers, so that collecting a
+            # wrapper does not close a buffer that is still read.
+            for wrapper in (out_wrapper, err_wrapper):
+                with contextlib.suppress(Exception):
+                    wrapper.flush()
+                with contextlib.suppress(Exception):
+                    wrapper.detach()
             termui.visible_prompt_func = saved_visible
             termui.hidden_prompt_func = saved_hidden
             termui._getchar = saved_getchar
@@ -346,6 +457,7 @@ class CliRunner:
         env: cabc.Mapping[str, str | None] | None = None,
         catch_exceptions: bool | None = None,
         color: bool = False,
+        mix_stderr: bool | None = None,
         **extra: t.Any,
     ) -> Result:
         """Run ``cli`` and return a :class:`Result`.
@@ -355,6 +467,8 @@ class CliRunner:
         :param env: environment overrides.
         :param catch_exceptions: overrides the runner's setting.
         :param color: keep ANSI styling in the output.
+        :param mix_stderr: ignored; stdout and stderr are always available
+            both separately and combined.
         :param extra: passed to :meth:`Command.main`.
         """
         if catch_exceptions is None:
@@ -394,9 +508,11 @@ class CliRunner:
             finally:
                 sys.stdout.flush()
                 sys.stderr.flush()
-                stdout = streams[0].getvalue()
-                stderr = streams[1].getvalue()
-                output = streams[2].getvalue()
+
+        # Read after the isolation ended, which adds descriptor output.
+        stdout = streams[0].getvalue()
+        stderr = streams[1].getvalue()
+        output = streams[2].getvalue()
 
         return Result(
             runner=self,

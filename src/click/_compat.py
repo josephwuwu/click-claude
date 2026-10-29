@@ -133,10 +133,8 @@ def _wrap_text(
 def _text_stream(
     stream: t.TextIO, encoding: str | None, errors: str | None
 ) -> t.TextIO:
-    if encoding is None and errors is None:
-        return stream
-    if encoding is not None and getattr(stream, "encoding", None) == encoding:
-        if errors is None or getattr(stream, "errors", None) == errors:
+    if encoding is None or getattr(stream, "encoding", None) == encoding:
+        if errors is None or getattr(stream, "errors", errors) == errors:
             return stream
     binary = _binary_of(stream)
     if binary is None:
