@@ -1,0 +1,22 @@
+[build-system]
+requires = ["flit_core<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "click"
+version = "8.3.0.dev0"
+description = "Composable command line interface toolkit (clean-room reimplementation)"
+readme = "README.md"
+license = {text = "BSD-3-Clause"}
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python",
+    "Typing :: Typed",
+]
+
+[tool.flit.module]
+name = "click"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
