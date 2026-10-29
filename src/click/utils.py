@@ -77,13 +77,23 @@ def _make_default_short_help(help: str, max_length: int = 45) -> str:
     if not words:
         return ""
 
+    def ends_sentence(idx: int) -> bool:
+        # A period ends a sentence if the text ends there or the next word
+        # starts like a sentence. That keeps "vs." or "e.g." inside one.
+        if not words[idx].endswith("."):
+            return False
+        if idx + 1 == len(words):
+            return True
+        first = words[idx + 1][:1]
+        return first.isupper() or first.isdigit()
+
     # First see whether whole words up to the end of a sentence fit.
     length = 0
     for idx, word in enumerate(words):
         length += len(word) + (1 if idx else 0)
         if length > max_length:
             break
-        if word.endswith("."):
+        if ends_sentence(idx):
             return " ".join(words[: idx + 1])
     else:
         return " ".join(words)
@@ -410,15 +420,8 @@ def _detect_program_name(
         path = sys.argv[0]
 
     package = getattr(_main, "__package__", None)
-    if package is None:
-        return os.path.basename(path)
-    if (
-        package == ""
-        and WIN
-        and not os.path.exists(path)
-        and os.path.exists(f"{path}.exe")
-    ):
-        # A console-script entry point on Windows.
+    if not package:
+        # Run as a script or an installed entry point.
         return os.path.basename(path)
 
     module = package

@@ -1902,8 +1902,6 @@ class Option(Parameter):
                 raise ValueError("`deprecated` options cannot use `prompt`.")
             if self.nargs == -1:
                 raise TypeError("nargs=-1 is not supported for options.")
-            if self.prompt and self.is_flag and not self.is_bool_flag:
-                raise TypeError("'prompt' is not valid for non-boolean flag.")
             if not self.is_bool_flag and self.secondary_opts:
                 raise TypeError("Secondary flag is not valid for non-boolean flag.")
             if self.is_bool_flag and self.hide_input and self.prompt is not None:
@@ -2210,8 +2208,14 @@ class Option(Parameter):
         if default is UNSET:
             default = None
 
+        show_default: bool | str = True if self.show_default is None else self.show_default
+
         if self.is_bool_flag:
-            return confirm(self.prompt, default)
+            return confirm(
+                self.prompt,
+                None if default is None else bool(default),
+                show_default=bool(show_default),
+            )
 
         return prompt(
             self.prompt,
@@ -2219,6 +2223,7 @@ class Option(Parameter):
             type=self.type,
             hide_input=self.hide_input,
             show_choices=self.show_choices,
+            show_default=show_default,
             confirmation_prompt=self.confirmation_prompt,
             value_proc=lambda x: self.process_value(ctx, x),
         )

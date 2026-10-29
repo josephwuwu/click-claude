@@ -32,7 +32,7 @@ if t.TYPE_CHECKING:
 ParamTypeValue = t.TypeVar("ParamTypeValue")
 
 
-class ParamType:
+class ParamType(t.Generic[ParamTypeValue]):
     """Base class for parameter types.
 
     Subclasses set :attr:`name` and implement :meth:`convert`. Conversion
@@ -171,7 +171,7 @@ class StringParamType(ParamType):
         return "STRING"
 
 
-class Choice(ParamType, t.Generic[ParamTypeValue]):
+class Choice(ParamType[ParamTypeValue]):
     """Accept only one of a fixed set of values.
 
     Choices may be strings or other objects such as enum members; the

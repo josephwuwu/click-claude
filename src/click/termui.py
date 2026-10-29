@@ -8,11 +8,14 @@ import collections.abc as cabc
 import inspect
 import io
 import itertools
+import os
 import sys
 import typing as t
 from contextlib import AbstractContextManager
+from contextlib import contextmanager
 from gettext import gettext as _
 
+from . import _compat
 from ._compat import isatty
 from ._compat import strip_ansi
 from .exceptions import Abort
@@ -64,7 +67,7 @@ _ansi_reset_all = "\033[0m"
 def _build_prompt(
     text: str,
     suffix: str,
-    show_default: bool = False,
+    show_default: bool | str = False,
     default: t.Any | None = None,
     show_choices: bool = True,
     type: ParamType | None = None,
@@ -72,9 +75,27 @@ def _build_prompt(
     parts = text
     if type is not None and show_choices and isinstance(type, Choice):
         parts += f" ({', '.join(map(str, type.choices))})"
-    if default is not None and show_default:
+    if isinstance(show_default, str):
+        # A description of the default replaces its value.
+        if show_default:
+            parts = f"{parts} [({show_default})]"
+    elif default is not None and show_default:
         parts = f"{parts} [{_format_default(default)}]"
     return f"{parts}{suffix}"
+
+
+def _mask_secret(message: str, secret: t.Any) -> str:
+    """Hide a hidden input that an error message repeats, quoted or as a
+    whole word, so that a typo'd password does not end up on screen.
+    """
+    import re
+
+    secret = str(secret)
+    if not secret:
+        return message
+    masked = message.replace(repr(secret), "'***'")
+    pattern = rf"(?<!\w){re.escape(secret)}(?!\w)"
+    return re.sub(pattern, lambda _: "'***'", masked)
 
 
 def _format_default(default: t.Any) -> t.Any:
@@ -84,23 +105,22 @@ def _format_default(default: t.Any) -> t.Any:
 
 
 def _ask(reader: t.Callable[[str], str], prompt_text: str, err: bool) -> str:
-    """Show ``prompt_text`` and read a line with ``reader``.
+    """Read a line with ``reader``, which shows ``prompt_text`` itself.
 
-    The prompt goes through :func:`echo`, so it is styled and routed like
-    other output. A trailing space is left to the input function instead:
-    readline would otherwise erase the whole prompt on backspace. With
-    ``err``, anything the input function writes goes to stderr too.
+    Handing the whole prompt to the input function lets readline know
+    where the editable part starts. With ``err``, the input function's
+    output is redirected so that the prompt appears on stderr. Styling is
+    removed when colors are off, like :func:`echo` does.
     """
-    head, tail = prompt_text, ""
-    if prompt_text.endswith(" "):
-        head, tail = prompt_text[:-1], " "
-    echo(head, nl=False, err=err)
+    target = sys.stderr if err else sys.stdout
+    if _compat.should_strip_ansi(target, resolve_color_default()):
+        prompt_text = strip_ansi(prompt_text)
     if not err:
-        return reader(tail)
+        return reader(prompt_text)
     from contextlib import redirect_stdout
 
     with redirect_stdout(sys.stderr):
-        return reader(tail)
+        return reader(prompt_text)
 
 
 def _read_line(prompt_text: str, hidden: bool, err: bool) -> str:
@@ -122,7 +142,7 @@ def prompt(
     type: ParamType | t.Any | None = None,
     value_proc: t.Callable[[str], t.Any] | None = None,
     prompt_suffix: str = ": ",
-    show_default: bool = True,
+    show_default: bool | str = True,
     err: bool = False,
     show_choices: bool = True,
 ) -> t.Any:
@@ -137,7 +157,8 @@ def prompt(
     :param type: converts and validates the answer.
     :param value_proc: custom conversion function instead of ``type``.
     :param prompt_suffix: appended to the question.
-    :param show_default: show the default in brackets.
+    :param show_default: show the default in brackets. A string is shown
+        instead of the default's value.
     :param err: write the question to stderr.
     :param show_choices: list the choices of a :class:`Choice` type.
     """
@@ -164,10 +185,8 @@ def prompt(
         try:
             result = value_proc(value)
         except UsageError as e:
-            if hide_input:
-                echo(_("Error: The value you entered was invalid."), err=err)
-            else:
-                echo(_("Error: {e.message}").format(e=e), err=err)
+            message = _mask_secret(e.message, value) if hide_input else e.message
+            echo(_("Error: {message}").format(message=message), err=err)
             continue
 
         if repeat_question is None:
@@ -239,8 +258,6 @@ def echo_via_pager(
         returning one.
     :param color: keep styling in the output.
     """
-    color = resolve_color_default(color)
-
     if inspect.isgeneratorfunction(text_or_generator):
         chunks = t.cast("t.Callable[[], cabc.Iterable[str]]", text_or_generator)()
     elif isinstance(text_or_generator, str):
@@ -248,9 +265,34 @@ def echo_via_pager(
     else:
         chunks = iter(t.cast("cabc.Iterable[str]", text_or_generator))
 
-    from ._termui_impl import pager
+    with get_pager_file(color=color) as pager:
+        for chunk in itertools.chain((str(c) for c in chunks), "\n"):
+            pager.write(chunk)
+            # Flush every chunk so that slow output reaches the pager as
+            # it is produced.
+            pager.flush()
 
-    pager(itertools.chain((str(c) for c in chunks), "\n"), color)
+
+@contextmanager
+def get_pager_file(color: bool | None = None) -> cabc.Iterator[t.TextIO]:
+    """Open a pager such as ``less`` and yield a file to write text to.
+    The pager shows the text once the block ends. When the output is not
+    a terminal, or no pager is available, text goes to stdout directly.
+
+    :param color: keep styling in the output. By default it is kept if
+        the pager is known to display it.
+    """
+    from . import _termui_impl
+
+    color = resolve_color_default(color)
+    with _termui_impl._pager_contextmanager(color=color) as (stream, pager_color):
+        if color is None:
+            color = bool(pager_color)
+        writer = _termui_impl._PagerWriter(stream, color)
+        try:
+            yield t.cast(t.TextIO, writer)
+        finally:
+            writer.flush()
 
 
 @t.overload
@@ -368,13 +410,26 @@ def clear() -> None:
     echo("\033[2J\033[1;1H", nl=False)
 
 
-def _interpret_color(color: int | tuple[int, int, int] | str, offset: int = 0) -> str:
-    if isinstance(color, int):
+def _is_channel(value: t.Any) -> bool:
+    return type(value) is int and 0 <= value <= 255
+
+
+def _interpret_color(color: t.Any, offset: int = 0) -> str:
+    """The SGR parameters selecting ``color``: a name, a 256-color index
+    or an RGB triple. Anything else is refused.
+    """
+    if isinstance(color, str) and color in _ansi_colors:
+        return str(_ansi_colors[color] + offset)
+    if _is_channel(color):
         return f"{38 + offset};5;{color:d}"
-    if isinstance(color, (tuple, list)):
+    if (
+        isinstance(color, (tuple, list))
+        and len(color) == 3
+        and all(_is_channel(c) for c in color)
+    ):
         r, g, b = color
         return f"{38 + offset};2;{r:d};{g:d};{b:d}"
-    return str(_ansi_colors[color] + offset)
+    raise ValueError(f"Unknown color {color!r}")
 
 
 _STYLE_CODES = {
@@ -416,12 +471,8 @@ def style(
 
     codes = []
     for color, offset in ((fg, 0), (bg, 10)):
-        if not color:
-            continue
-        try:
+        if color is not None:
             codes.append(f"\033[{_interpret_color(color, offset)}m")
-        except KeyError:
-            raise TypeError(f"Unknown color {color!r}") from None
 
     flags = {
         "bold": bold,
@@ -521,7 +572,7 @@ def edit(
     ed = Editor(editor=editor, env=env, require_save=require_save, extension=extension)
     if filename is None:
         return ed.edit(text)
-    if isinstance(filename, str):
+    if isinstance(filename, (str, os.PathLike)):
         filename = (filename,)
     ed.edit_files(filename)
     return None

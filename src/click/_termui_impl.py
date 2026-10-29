@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import collections.abc as cabc
 import contextlib
+import io
 import math
 import os
 import shlex
@@ -14,7 +15,6 @@ import time
 import typing as t
 from gettext import gettext as _
 from io import StringIO
-from shutil import which
 from types import TracebackType
 
 from ._compat import CYGWIN
@@ -37,7 +37,7 @@ else:
     AFTER_BAR = "\033[?25h\n"
 
 
-def _default_stdout() -> t.TextIO | None:
+def _default_text_stdout() -> t.TextIO | None:
     return sys.stdout
 
 
@@ -75,7 +75,7 @@ class ProgressBar(t.Generic[V]):
         self.label: str = label or ""
 
         if file is None:
-            file = _default_stdout()
+            file = _default_text_stdout()
             if file is None:
                 # No console at all, e.g. pythonw.
                 file = StringIO()
@@ -273,12 +273,20 @@ class ProgressBar(t.Generic[V]):
         self.eta_known = self.length is not None
 
     def update(self, n_steps: int, current_item: V | None = None) -> None:
-        """Advance by ``n_steps`` and optionally set the current item."""
+        """Advance by ``n_steps`` and optionally set the current item.
+
+        Redrawing waits until ``update_min_steps`` steps accumulated, but
+        the steps that complete the bar are always applied.
+        """
         if current_item is not None:
             self.current_item = current_item
 
         self._completed_intervals += n_steps
-        if self._completed_intervals >= self.update_min_steps:
+        reaches_end = (
+            self.length is not None
+            and self.pos + self._completed_intervals >= self.length
+        )
+        if self._completed_intervals >= self.update_min_steps or reaches_end:
             self.make_step(self._completed_intervals)
             self.render_progress()
             self._completed_intervals = 0
@@ -304,136 +312,263 @@ class ProgressBar(t.Generic[V]):
             yield item
             self.update(1)
 
+        if self._completed_intervals:
+            self.make_step(self._completed_intervals)
+            self._completed_intervals = 0
         self.finish()
         self.render_progress()
 
 
-def pager(generator: cabc.Iterable[str], color: bool | None = None) -> None:
-    """Send the text through a pager, or print it directly if output is
-    not interactive.
+class _PagerWriter:
+    """The file object handed out by :func:`click.get_pager_file`.
+
+    It writes text to the pager's input, which may be a text or a binary
+    stream, and removes styling unless :attr:`color` is set. Closing it
+    only flushes: the stream belongs to the pager strategy.
     """
-    stdout = _default_stdout()
-    if stdout is None:
-        stdout = StringIO()
 
-    if not isatty(sys.stdin) or not isatty(stdout):
-        return _nullpager(stdout, generator, color)
+    def __init__(self, stream: t.IO[t.Any], color: bool) -> None:
+        self._stream = stream
+        self.color = color
+        self._binary = not isinstance(stream, io.TextIOBase) and not hasattr(
+            stream, "encoding"
+        )
+        self._encoding = get_best_encoding(sys.stdout) if sys.stdout else "utf-8"
 
-    command = (os.environ.get("PAGER") or "").strip()
-    if command:
-        if WIN:
-            if _tempfilepager(generator, command, color):
-                return
-        elif _pipepager(generator, command, color):
-            return
+    def write(self, text: str) -> int:
+        if not self.color:
+            text = strip_ansi(text)
+        if self._binary:
+            self._stream.write(text.encode(self._encoding, "replace"))
+        else:
+            self._stream.write(text)
+        return len(text)
 
-    if os.environ.get("TERM") in ("dumb", "emacs"):
-        return _nullpager(stdout, generator, color)
-    if (WIN or sys.platform.startswith("os2")) and _tempfilepager(generator, "more", color):
-        return
-    if _pipepager(generator, "less", color):
-        return
-    if _pipepager(generator, "more", color):
-        return
-    return _nullpager(stdout, generator, color)
+    def writelines(self, lines: cabc.Iterable[str]) -> None:
+        for line in lines:
+            self.write(line)
 
+    def flush(self) -> None:
+        self._stream.flush()
 
-def _pipepager(generator: cabc.Iterable[str], command: str, color: bool | None) -> bool:
-    """Pipe the text into ``command``. Returns ``False`` if the command is
-    not available.
-    """
-    import subprocess
+    def close(self) -> None:
+        self.flush()
 
-    parts = shlex.split(command)
-    if not parts:
-        return False
-    executable = which(parts[0])
-    if executable is None:
+    def isatty(self) -> bool:
         return False
 
-    env = dict(os.environ)
-    name = os.path.basename(executable).lower()
-    if name.endswith(".exe"):
-        name = name[:-4]
+    def writable(self) -> bool:
+        return True
 
-    if name == "less":
-        # less shows escape codes raw unless told otherwise; -R passes
-        # colors through.
-        flags = os.environ.get("LESS", "") + "".join(parts[1:])
-        if not flags:
-            env["LESS"] = "-R"
-            color = True
-        elif "r" in flags or "R" in flags:
-            color = True
+    def __enter__(self) -> _PagerWriter:
+        return self
 
-    proc = subprocess.Popen(
-        [executable, *parts[1:]],
-        shell=False,
-        stdin=subprocess.PIPE,
-        env=env,
-        errors="replace",
-        text=True,
-    )
-    assert proc.stdin is not None
-    try:
-        for chunk in generator:
-            if not color:
-                chunk = strip_ansi(chunk)
-            proc.stdin.write(chunk)
-    except BrokenPipeError:
-        # The pager was closed early; that is fine.
-        pass
-    except Exception as e:
-        proc.terminate()
-        raise e
-    finally:
-        try:
-            proc.stdin.close()
-        except BrokenPipeError:
-            pass
+    def __exit__(self, *exc_info: t.Any) -> None:
+        self.close()
 
-    # Wait for the pager; ignore Ctrl-C so the pager can handle it.
+
+def _wait_ignoring_interrupts(proc: t.Any) -> None:
+    """Wait for the pager. Ctrl-C belongs to the pager while it runs."""
     while True:
         try:
             proc.wait()
         except KeyboardInterrupt:
             continue
-        break
-    return True
+        return
 
 
-def _tempfilepager(generator: cabc.Iterable[str], command: str, color: bool | None) -> bool:
-    """Write the text to a file and run ``command`` on it."""
+def _is_less(cmd_path: str | os.PathLike[str]) -> bool:
+    stem = os.path.splitext(os.path.basename(os.fspath(cmd_path)))[0]
+    if WIN:
+        # Windows file names are case-insensitive.
+        return stem.casefold() == "less"
+    return stem == "less"
+
+
+def _less_shows_raw_colors(tokens: cabc.Iterable[str]) -> bool:
+    """Whether ``less`` options request raw control characters, which is
+    what makes it render colors.
+    """
+    for token in tokens:
+        if token == "--":
+            break
+        if token.startswith("--"):
+            if token[2:] in ("RAW-CONTROL-CHARS", "raw-control-chars"):
+                return True
+        elif token.startswith("-") and len(token) > 1:
+            if "r" in token[1:] or "R" in token[1:]:
+                return True
+    return False
+
+
+def _split_less_env(value: str) -> list[str]:
+    try:
+        return shlex.split(value)
+    except ValueError:
+        return value.split()
+
+
+@contextlib.contextmanager
+def _pipepager(
+    cmd_path: str | os.PathLike[str], cmd_params: cabc.Sequence[str]
+) -> cabc.Iterator[tuple[t.IO[t.Any], bool | None]]:
+    """Run the pager and yield its input stream, plus whether it shows
+    colors (``True``) or there is no opinion (``None``).
+
+    If the output fails with an error, the pager is stopped. On Ctrl-C it
+    stays open so the user can read what arrived; the interrupt is raised
+    once they close it.
+    """
+    import subprocess
+
+    env = dict(os.environ)
+    color: bool | None = None
+
+    if _is_less(cmd_path):
+        less_env = os.environ.get("LESS", "")
+        if not less_env and not cmd_params:
+            env["LESS"] = "-R"
+            color = True
+        elif _less_shows_raw_colors([*_split_less_env(less_env), *cmd_params]):
+            color = True
+
+    proc = subprocess.Popen(
+        [os.fspath(cmd_path), *cmd_params], stdin=subprocess.PIPE, env=env
+    )
+    stdin = proc.stdin
+    assert stdin is not None
+
+    def close_input() -> None:
+        try:
+            stdin.close()
+        except BrokenPipeError:
+            pass
+
+    try:
+        yield stdin, color
+    except BrokenPipeError:
+        # The user quit the pager before all output was written.
+        pass
+    except KeyboardInterrupt:
+        close_input()
+        _wait_ignoring_interrupts(proc)
+        raise
+    except BaseException:
+        proc.terminate()
+        close_input()
+        proc.wait()
+        raise
+
+    close_input()
+    _wait_ignoring_interrupts(proc)
+
+
+@contextlib.contextmanager
+def _tempfilepager(
+    cmd_path: str | os.PathLike[str], cmd_params: cabc.Sequence[str]
+) -> cabc.Iterator[tuple[t.IO[t.Any], bool | None]]:
+    """Collect the output in a temporary file and show it with the pager
+    afterwards. Used where pipes to interactive pagers do not work.
+    """
     import subprocess
     import tempfile
 
-    parts = shlex.split(command)
-    if not parts:
-        return False
-    executable = which(parts[0])
-    if executable is None:
-        return False
-
-    text = "".join(generator)
-    if not color:
-        text = strip_ansi(text)
-    encoding = get_best_encoding(sys.stdout)
-
-    fd, filename = tempfile.mkstemp()
+    encoding = get_best_encoding(sys.stdout) if sys.stdout else "utf-8"
+    f = tempfile.NamedTemporaryFile(
+        mode="w", encoding=encoding, errors="replace", delete=False
+    )
     try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(text.encode(encoding))
-        subprocess.call([executable, *parts[1:], filename])
+        try:
+            yield f, None
+        finally:
+            # Close before the file is shown or removed, also on errors:
+            # Windows refuses both while it is open.
+            f.close()
+        subprocess.call([os.fspath(cmd_path), *cmd_params, f.name])
     finally:
-        os.unlink(filename)
-    return True
+        os.unlink(f.name)
 
 
-def _nullpager(stream: t.TextIO, generator: cabc.Iterable[str], color: bool | None) -> None:
-    for chunk in generator:
-        if not color:
-            chunk = strip_ansi(chunk)
-        stream.write(chunk)
+@contextlib.contextmanager
+def _nullpager(
+    stream: t.IO[t.Any],
+) -> cabc.Iterator[tuple[t.IO[t.Any], bool | None]]:
+    """Write straight to ``stream``, which is borrowed and stays open."""
+    try:
+        yield stream, None
+    finally:
+        stream.flush()
+
+
+def _pager_command() -> list[str] | None:
+    """The pager command from ``PAGER``, split into arguments. ``None`` if
+    it is not set; an empty list if it is set but blank.
+    """
+    value = os.environ.get("PAGER")
+    if value is None:
+        return None
+    return shlex.split(value)
+
+
+@contextlib.contextmanager
+def _pager_contextmanager(
+    color: bool | None = None,
+) -> cabc.Iterator[tuple[t.IO[t.Any], bool | None]]:
+    """Pick how to page and yield the stream to write to, plus the pager's
+    opinion about colors.
+
+    Output that is not interactive is written directly. Otherwise the
+    ``PAGER`` command is used, or a platform default. If no pager can be
+    found, output is written directly too.
+    """
+    import shutil
+
+    stdout = _default_text_stdout()
+    if stdout is None:
+        stdout = StringIO()
+
+    if not isatty(sys.stdin) or not isatty(stdout):
+        with _nullpager(stdout) as rv:
+            yield rv
+        return
+
+    strategy = _tempfilepager if WIN else _pipepager
+
+    command = _pager_command()
+    if command:
+        path = shutil.which(command[0])
+        if path is not None:
+            with strategy(path, command[1:]) as rv:
+                yield rv
+            return
+        # A pager was asked for but is missing: do not guess another one.
+        with _nullpager(stdout) as rv:
+            yield rv
+        return
+
+    if os.environ.get("TERM") not in ("dumb", "emacs"):
+        candidates = ("more",) if WIN or sys.platform.startswith("os2") else ("less", "more")
+        for name in candidates:
+            path = shutil.which(name)
+            if path is not None:
+                with strategy(path, []) as rv:
+                    yield rv
+                return
+
+    with _nullpager(stdout) as rv:
+        yield rv
+
+
+def pager(generator: cabc.Iterable[str], color: bool | None = None) -> None:
+    """Show text chunks in a pager, flushing after each one so that slow
+    producers show up incrementally.
+    """
+    from .termui import get_pager_file
+
+    with get_pager_file(color=color) as out:
+        for chunk in generator:
+            out.write(chunk)
+            out.flush()
 
 
 class Editor:
@@ -458,12 +593,18 @@ class Editor:
                 return value
         if WIN:
             return "notepad"
+        import shutil
+
         for candidate in ("sensible-editor", "vim", "nano"):
-            if which(candidate) is not None:
+            if shutil.which(candidate) is not None:
                 return candidate
         return "vi"
 
-    def edit_files(self, filenames: cabc.Iterable[str]) -> None:
+    def edit_files(self, filenames: cabc.Iterable[str | os.PathLike[str]]) -> None:
+        """Run the editor on the files. The editor setting is split like a
+        shell command line, so it may carry arguments and quoted paths;
+        no shell is involved.
+        """
         import subprocess
 
         editor = self.get_editor()
@@ -472,9 +613,9 @@ class Editor:
             env = dict(os.environ)
             env.update(self.env)
 
-        quoted = " ".join(f'"{name}"' for name in filenames)
+        args = [*shlex.split(editor), *(os.fspath(f) for f in filenames)]
         try:
-            proc = subprocess.Popen(f"{editor} {quoted}", env=env, shell=True)
+            proc = subprocess.Popen(args, env=env)
             code = proc.wait()
         except OSError as e:
             raise ClickException(
