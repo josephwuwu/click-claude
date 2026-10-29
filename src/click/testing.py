@@ -116,6 +116,20 @@ class _NamedTextIOWrapper(io.TextIOWrapper):
         self._name = name
         self._mode = mode
         self._fileno = fileno
+        self._released = False
+
+    def close(self) -> None:
+        """Flush and let go of the buffer without closing it: the runner
+        still reads the buffer after the code under test is done with the
+        stream, even if it was closed or collected.
+        """
+        if getattr(self, "_released", True):
+            return
+        self._released = True
+        with contextlib.suppress(Exception):
+            self.flush()
+        with contextlib.suppress(Exception):
+            self.detach()
 
     def fileno(self) -> int:
         # With fd capture the descriptor is redirected too, so code that
@@ -435,13 +449,8 @@ class CliRunner:
                 else:
                     os.environ[key] = value
             sys.stdin, sys.stdout, sys.stderr = saved_streams
-            # Release the buffers from the wrappers, so that collecting a
-            # wrapper does not close a buffer that is still read.
-            for wrapper in (out_wrapper, err_wrapper):
-                with contextlib.suppress(Exception):
-                    wrapper.flush()
-                with contextlib.suppress(Exception):
-                    wrapper.detach()
+            out_wrapper.close()
+            err_wrapper.close()
             termui.visible_prompt_func = saved_visible
             termui.hidden_prompt_func = saved_hidden
             termui._getchar = saved_getchar

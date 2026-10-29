@@ -89,10 +89,13 @@ class UsageError(ClickException):
         hint = ""
         if self.ctx is not None:
             color = self.ctx.color
-            if self.ctx.command.get_help_option(self.ctx) is not None:
+            command = self.ctx.command
+            if command.get_help_option(self.ctx) is not None:
+                # The longest available name reads best, like ``--help``.
+                names = command.get_help_option_names(self.ctx)
                 hint = _("Try '{command} {option}' for help.").format(
                     command=self.ctx.command_path,
-                    option=self.ctx.help_option_names[0],
+                    option=max(names, key=len),
                 )
                 hint = f"{hint}\n"
             echo(f"{self.ctx.get_usage()}\n{hint}", file=file, color=color)

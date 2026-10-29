@@ -55,7 +55,9 @@ def _paragraphs(text: str) -> list[tuple[int, bool, str]]:
         lines.clear()
 
     for line in text.splitlines():
-        if not line.strip():
+        # Only an empty line separates paragraphs. A line of spaces is
+        # content, if blank content.
+        if not line:
             flush()
             indent = None
             continue

@@ -149,6 +149,12 @@ def _deprecated_note(deprecated: bool | str) -> str:
     return "(DEPRECATED)"
 
 
+def _with_deprecation_note(text: str | None, deprecated: bool | str) -> str:
+    """Append the deprecation label to a help text, which may be empty."""
+    note = _deprecated_note(deprecated)
+    return f"{text} {note}" if text else note
+
+
 class Context:
     """State for one level of command execution.
 
@@ -312,11 +318,12 @@ class Context:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         tb: TracebackType | None,
-    ) -> None:
+    ) -> bool | None:
         self._depth -= 1
         try:
             if self._depth == 0:
-                self.close()
+                return self._close_with_exception_info(exc_type, exc_value, tb)
+            return None
         finally:
             pop_context()
 
@@ -359,8 +366,19 @@ class Context:
 
     def close(self) -> None:
         """Run the close callbacks and exit the resources of this context."""
-        self._exit_stack.close()
-        self._exit_stack = ExitStack()
+        self._close_with_exception_info(None, None, None)
+
+    def _close_with_exception_info(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        """Close, telling the resources about the exception being handled.
+        A resource may suppress it, in which case this returns true.
+        """
+        stack, self._exit_stack = self._exit_stack, ExitStack()
+        return stack.__exit__(exc_type, exc_value, tb)
 
     @property
     def command_path(self) -> str:
@@ -547,6 +565,23 @@ def _warn_about_shared_names(params: cabc.Sequence[Parameter]) -> None:
             names[param.name] = 0
 
 
+def _best_effort(func: t.Callable[[], t.Any]) -> None:
+    """Run ``func``, giving up quietly if the user interrupts it."""
+    try:
+        func()
+    except KeyboardInterrupt:
+        pass
+
+
+def _exit_with(code: int) -> t.NoReturn:
+    """Exit with ``code``, even if the user interrupts the exit itself."""
+    while True:
+        try:
+            sys.exit(code)
+        except KeyboardInterrupt:
+            continue
+
+
 class Command:
     """A single command with parameters and a callback.
 
@@ -649,7 +684,8 @@ class Command:
         for param in self.params:
             taken.update(param.opts)
             taken.update(param.secondary_opts)
-        return [name for name in ctx.help_option_names if name not in taken]
+        names = dict.fromkeys(ctx.help_option_names)
+        return [name for name in names if name not in taken]
 
     def get_help_option(self, ctx: Context) -> Option | None:
         """The help option, or ``None`` if it is disabled. The object is
@@ -698,9 +734,7 @@ class Command:
         else:
             text = ""
         if self.deprecated:
-            text = _("{text} {deprecated_message}").format(
-                text=text, deprecated_message=_deprecated_note(self.deprecated)
-            )
+            text = _with_deprecation_note(text, self.deprecated)
         return text.strip()
 
     def format_help(self, ctx: Context, formatter: HelpFormatter) -> None:
@@ -714,9 +748,7 @@ class Command:
         # Text after a form feed is for documentation tools only.
         text = inspect.cleandoc(self.help).partition("\f")[0] if self.help else ""
         if self.deprecated:
-            text = _("{text} {deprecated_message}").format(
-                text=text, deprecated_message=_deprecated_note(self.deprecated)
-            )
+            text = _with_deprecation_note(text, self.deprecated)
         if text:
             formatter.write_paragraph()
             with formatter.indentation():
@@ -766,8 +798,14 @@ class Command:
         for key, value in self.context_settings.items():
             extra.setdefault(key, value)
         ctx = self.context_class(self, info_name=info_name, parent=parent, **extra)
-        with ctx.scope(cleanup=False):
-            self.parse_args(ctx, args)
+        try:
+            with ctx.scope(cleanup=False):
+                self.parse_args(ctx, args)
+        except BaseException:
+            # Parsing stopped early, for example through an eager callback
+            # calling ``ctx.exit()``. Release what callbacks registered.
+            ctx.close()
+            raise
         return ctx
 
     def parse_args(self, ctx: Context, args: list[str]) -> list[str]:
@@ -902,6 +940,8 @@ class Command:
 
         self._main_shell_completion(extra, prog_name, complete_var)
 
+        # In standalone mode, once the outcome is known a late Ctrl-C must
+        # not change it: messages are best effort and the exit is retried.
         try:
             try:
                 with self.make_context(prog_name, args, **extra) as ctx:
@@ -910,29 +950,32 @@ class Command:
                         return rv
                     ctx.exit()
             except (EOFError, KeyboardInterrupt) as e:
-                echo(file=sys.stderr)
+                if standalone_mode:
+                    _best_effort(lambda: echo(file=sys.stderr))
+                else:
+                    echo(file=sys.stderr)
                 raise Abort() from e
             except ClickException as e:
                 if not standalone_mode:
                     raise
-                e.show()
-                sys.exit(e.exit_code)
+                _best_effort(e.show)
+                _exit_with(e.exit_code)
             except OSError as e:
                 if e.errno != errno.EPIPE:
                     raise
                 # The reader went away; silence further flush errors.
                 sys.stdout = t.cast(t.TextIO, _PacifyFlushWrapper(sys.stdout))
                 sys.stderr = t.cast(t.TextIO, _PacifyFlushWrapper(sys.stderr))
-                sys.exit(1)
+                _exit_with(1)
         except Exit as e:
             if standalone_mode:
-                sys.exit(e.exit_code)
+                _exit_with(e.exit_code)
             return e.exit_code
         except Abort:
             if not standalone_mode:
                 raise
-            echo(_("Aborted!"), file=sys.stderr)
-            sys.exit(1)
+            _best_effort(lambda: echo(_("Aborted!"), file=sys.stderr))
+            _exit_with(1)
 
     def _main_shell_completion(
         self,
@@ -1019,10 +1062,13 @@ class Group(Command):
         self.invoke_without_command = invoke_without_command
 
         if subcommand_metavar is None:
+            # The first subcommand is bracketed when it may be left out.
+            first = "COMMAND1" if chain else "COMMAND"
+            if invoke_without_command:
+                first = f"[{first}]"
+            subcommand_metavar = f"{first} [ARGS]..."
             if chain:
-                subcommand_metavar = "COMMAND1 [ARGS]... [COMMAND2 [ARGS]...]..."
-            else:
-                subcommand_metavar = "COMMAND [ARGS]..."
+                subcommand_metavar += " [COMMAND2 [ARGS]...]..."
         self.subcommand_metavar = subcommand_metavar
         self.chain = chain
         self._result_callback = result_callback
@@ -1314,16 +1360,17 @@ def _warn_about_name(name: str, kind: str) -> None:
     if not name.isidentifier():
         warnings.warn(
             f"The {kind} name {name!r} is not a valid Python identifier, so it"
-            " can only be received through '**kwargs'. Click 9.0 will refuse"
-            " it; use a declaration that transforms into an identifier.",
+            " can only be received through '**kwargs'. This will raise a"
+            " TypeError in Click 9.0; use a declaration that transforms into"
+            " an identifier.",
             DeprecationWarning,
             stacklevel=4,
         )
     elif keyword.iskeyword(name):
         warnings.warn(
             f"The {kind} name {name!r} is a Python keyword, so it can only be"
-            " received through '**kwargs'. Click 9.0 will refuse it; pass an"
-            " explicit name.",
+            " received through '**kwargs'. This will raise a TypeError in"
+            " Click 9.0; pass an explicit name.",
             DeprecationWarning,
             stacklevel=4,
         )
@@ -1841,8 +1888,7 @@ class Option(Parameter):
             prompt_text = prompt
 
         if deprecated:
-            note = _deprecated_note(deprecated)
-            help = f"{help} {note}" if help else note
+            help = _with_deprecation_note(help, deprecated)
 
         self.prompt = prompt_text
         self.confirmation_prompt = confirmation_prompt
@@ -1974,6 +2020,13 @@ class Option(Parameter):
         best = max(candidates, key=lambda c: c[0], default=None)
         self._spec: str | None = best[2] if best is not None else None
 
+        if explicit is not None and not opts and not secondary_opts:
+            raise TypeError(
+                f"No options defined but a name was passed ({explicit})."
+                " Did you mean to declare an argument instead? Did"
+                f" you mean to pass '--{explicit}'?"
+            )
+
         name: str | None
         if explicit is not None:
             name = explicit
@@ -2010,13 +2063,6 @@ class Option(Parameter):
                 return "", opts, secondary_opts
             raise TypeError(
                 f"Could not determine name for option with declarations {decls!r}"
-            )
-
-        if not opts and not secondary_opts:
-            raise TypeError(
-                f"No options defined but a name was passed ({name})."
-                " Did you mean to declare an argument instead? Did"
-                f" you mean to pass '--{name}'?"
             )
 
         return name, opts, secondary_opts
@@ -2333,6 +2379,8 @@ class Argument(Parameter):
 
         if help:
             help = inspect.cleandoc(help)
+        if self.deprecated:
+            help = _with_deprecation_note(help, self.deprecated)
         self.help = help
 
     def to_info_dict(self) -> dict[str, t.Any]:
@@ -2366,11 +2414,7 @@ class Argument(Parameter):
         return self.make_metavar(ctx)
 
     def get_help_record(self, ctx: Context) -> tuple[str, str]:
-        help = self.help or ""
-        if self.deprecated:
-            note = _deprecated_note(self.deprecated)
-            help = f"{help} {note}" if help else note
-        return self.get_help_spec(ctx), help
+        return self.get_help_spec(ctx), self.help or ""
 
     def _parse_decls(
         self, decls: cabc.Sequence[str], expose_value: bool
