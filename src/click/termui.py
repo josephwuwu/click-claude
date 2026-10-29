@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from gettext import gettext as _
 
 from . import _compat
+from . import _termui_impl
 from ._compat import isatty
 from ._compat import strip_ansi
 from .exceptions import Abort
@@ -282,8 +283,6 @@ def get_pager_file(color: bool | None = None) -> cabc.Iterator[t.TextIO]:
     :param color: keep styling in the output. By default it is kept if
         the pager is known to display it.
     """
-    from . import _termui_impl
-
     color = resolve_color_default(color)
     with _termui_impl._pager_contextmanager(color=color) as (stream, pager_color):
         if color is None:

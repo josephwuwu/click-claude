@@ -7,11 +7,8 @@ from __future__ import annotations
 import collections.abc as cabc
 import contextlib
 import io
-import math
 import os
-import shlex
 import sys
-import time
 import typing as t
 from gettext import gettext as _
 from io import StringIO
@@ -103,6 +100,8 @@ class ProgressBar(t.Generic[V]):
         self.avg: list[float] = []
         self.last_eta: float
         self.start: float
+        import time
+
         self.start = self.last_eta = time.time()
         self.eta_known: bool = False
         self.finished: bool = False
@@ -186,6 +185,8 @@ class ProgressBar(t.Generic[V]):
         # Unknown length: a marker that swings back and forth.
         cells = list(self.empty_char * (self.width or 1))
         if self.time_per_iteration != 0:
+            import math
+
             spot = (math.cos(self.pos * self.time_per_iteration) / 2.0 + 0.5) * self.width
             cells[int(spot)] = self.fill_char
         return "".join(cells)
@@ -260,6 +261,8 @@ class ProgressBar(t.Generic[V]):
         self.pos += n_steps
         if self.length is not None and self.pos >= self.length:
             self.finished = True
+
+        import time
 
         now = time.time()
         if now - self.last_eta < 1.0:
@@ -402,6 +405,8 @@ def _less_shows_raw_colors(tokens: cabc.Iterable[str]) -> bool:
 
 
 def _split_less_env(value: str) -> list[str]:
+    import shlex
+
     try:
         return shlex.split(value)
     except ValueError:
@@ -507,6 +512,8 @@ def _pager_command() -> list[str] | None:
     value = os.environ.get("PAGER")
     if value is None:
         return None
+    import shlex
+
     return shlex.split(value)
 
 
@@ -612,6 +619,8 @@ class Editor:
         if self.env:
             env = dict(os.environ)
             env.update(self.env)
+
+        import shlex
 
         args = [*shlex.split(editor), *(os.fspath(f) for f in filenames)]
         try:
@@ -752,11 +761,11 @@ if sys.platform == "win32":
         return ch
 
 else:
-    import termios
-    import tty
-
     @contextlib.contextmanager
     def raw_terminal() -> cabc.Iterator[int]:
+        import termios
+        import tty
+
         f: t.TextIO | None
         if isatty(sys.stdin):
             fd = sys.stdin.fileno()

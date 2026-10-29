@@ -76,4 +76,6 @@ cd upstream-tests && PYTHONPATH=../src python -m pytest tests
 
 Result: all 2262 tests pass. 24 are skipped because they only run on
 Windows, and 1 is marked as an expected failure upstream. The stress tests
-(`-m stress`) are deselected by default, as upstream does.
+(`-m stress`) are deselected by default, as upstream does; they pass when run
+explicitly (all 1000 pager cases and a 1 in 20 sample of the 30000 stream
+lifecycle cases were run).
