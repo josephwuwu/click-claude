@@ -76,6 +76,8 @@ Windows, and 1 is marked as an expected failure upstream. The stress tests
 explicitly (all 1000 pager cases and a 1 in 20 sample of the 30000 stream
 lifecycle cases were run).
 
+The full list of checks and per-file results is in [TEST_REPORT.md](TEST_REPORT.md).
+
 ## Credits
 
 Created by [josephwuwu](https://github.com/josephwuwu), with the
