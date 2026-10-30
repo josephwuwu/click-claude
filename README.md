@@ -55,19 +55,15 @@ heavier ones are imported when first needed.
 ## Compatibility testing
 
 The behavior is checked against the upstream test suite (main branch, which
-targets Click 8.6). Only the `tests/` directory is fetched, never the
-upstream source:
+targets Click 8.6). Only the `tests/` directory and the pytest configuration
+in `pyproject.toml` are fetched, never the upstream source:
 
 ```bash
 git clone --depth 1 --filter=blob:none --sparse https://github.com/pallets/click.git upstream-tests
 ```
 
 ```bash
-git -C upstream-tests sparse-checkout set --no-cone '/tests/'
-```
-
-```bash
-cp pyproject.toml upstream-tests/
+git -C upstream-tests sparse-checkout set --no-cone '/tests/' '/pyproject.toml'
 ```
 
 ```bash
