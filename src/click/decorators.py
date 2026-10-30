@@ -412,13 +412,15 @@ def _installed_version(package_name: str) -> str:
 
 
 def custom_version_option(
-    message: t.Callable[[Context], str], *param_decls: str, **kwargs: t.Any
+    callback: t.Callable[[Context], str], *param_decls: str, **kwargs: t.Any
 ) -> t.Callable[[FC], FC]:
-    """Add a ``--version`` flag that prints ``message(ctx)`` and exits.
+    """Add a ``--version`` flag that prints ``callback(ctx)`` and exits.
     Use this when the version text is not derived from package metadata.
     """
 
-    def callback(ctx: Context, param: Parameter, value: bool) -> None:
+    message = callback
+
+    def show(ctx: Context, param: Parameter, value: bool) -> None:
         if not value or ctx.resilient_parsing:
             return
         echo(message(ctx), color=ctx.color)
@@ -431,7 +433,7 @@ def custom_version_option(
     kwargs.setdefault("expose_value", False)
     kwargs.setdefault("is_eager", True)
     kwargs.setdefault("help", _("Show the version and exit."))
-    kwargs["callback"] = callback
+    kwargs["callback"] = show
     return option(*param_decls, **kwargs)
 
 

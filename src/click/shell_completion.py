@@ -43,7 +43,7 @@ def shell_complete(
     if action == "source":
         # Written as bytes so that the script keeps LF line endings even
         # where the text stream would translate them.
-        echo(comp.source().encode("utf-8"))
+        echo(comp.source().encode("utf-8"), nl=False)
         return 0
     if action == "complete":
         echo(comp.complete())

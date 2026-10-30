@@ -27,6 +27,13 @@ if t.TYPE_CHECKING:
     from .core import Command
 
 
+#: How :class:`CliRunner` captures output.
+CaptureMode = t.Literal["sys", "fd"]
+
+#: The ``(type, value, traceback)`` triple of a caught exception.
+ExceptionInfo = tuple[type[BaseException], BaseException, TracebackType]
+
+
 class EchoingStdin:
     """Stdin replacement that copies everything read to an output stream,
     so that input shows up in the captured output like on a terminal.

@@ -222,6 +222,36 @@ class NoSuchOption(UsageError):
         return f"{self.message} {suggestion}"
 
 
+class NoSuchCommand(UsageError):
+    """A subcommand that does not exist was invoked."""
+
+    def __init__(
+        self,
+        command_name: str,
+        message: str | None = None,
+        possibilities: t.Iterable[str] | None = None,
+        ctx: Context | None = None,
+    ) -> None:
+        if message is None:
+            message = _("No such command {name!r}.").format(name=command_name)
+        super().__init__(message, ctx)
+        self.command_name = command_name
+        # Given all known command names, keeps only the close matches.
+        from difflib import get_close_matches
+
+        self.possibilities = (
+            get_close_matches(command_name, list(possibilities))
+            if possibilities is not None
+            else None
+        )
+
+    def format_message(self) -> str:
+        suggestion = _suggestion(self.possibilities)
+        if not suggestion:
+            return self.message
+        return f"{self.message} {suggestion}"
+
+
 class BadOptionUsage(UsageError):
     """An option was used the wrong way, for example with the wrong number
     of values.

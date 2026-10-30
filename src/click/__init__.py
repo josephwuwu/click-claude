@@ -13,6 +13,7 @@ from .core import Context as Context
 from .core import Group as Group
 from .core import Option as Option
 from .core import Parameter as Parameter
+from .core import ParameterSource as ParameterSource
 from .decorators import argument as argument
 from .decorators import command as command
 from .decorators import confirmation_option as confirmation_option
@@ -32,6 +33,7 @@ from .exceptions import BadParameter as BadParameter
 from .exceptions import ClickException as ClickException
 from .exceptions import FileError as FileError
 from .exceptions import MissingParameter as MissingParameter
+from .exceptions import NoSuchCommand as NoSuchCommand
 from .exceptions import NoSuchOption as NoSuchOption
 from .exceptions import UsageError as UsageError
 from .formatting import HelpFormatter as HelpFormatter

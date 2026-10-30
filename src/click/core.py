@@ -131,16 +131,16 @@ def iter_params_for_processing(
 class ParameterSource(enum.Enum):
     """Where the value of a parameter came from."""
 
+    #: Entered at an interactive prompt.
+    PROMPT = enum.auto()
     #: Given on the command line.
     COMMANDLINE = enum.auto()
     #: Read from an environment variable.
     ENVIRONMENT = enum.auto()
-    #: The parameter's default.
-    DEFAULT = enum.auto()
     #: The context's ``default_map``.
     DEFAULT_MAP = enum.auto()
-    #: Entered at an interactive prompt.
-    PROMPT = enum.auto()
+    #: The parameter's default.
+    DEFAULT = enum.auto()
 
 
 def _deprecated_note(deprecated: bool | str) -> str:
@@ -1274,15 +1274,11 @@ class Group(Command):
             if _split_opt(cmd_name)[0]:
                 # Looks like an option; let the parser produce the error.
                 self.parse_args(ctx, args)
-            from difflib import get_close_matches
+            from .exceptions import NoSuchCommand
 
-            from .exceptions import _suggestion
-
-            message = _("No such command {name!r}.").format(name=original)
-            hint = _suggestion(get_close_matches(original, self.list_commands(ctx)))
-            if hint:
-                message = f"{message} {hint}"
-            ctx.fail(message)
+            raise NoSuchCommand(
+                original, possibilities=self.list_commands(ctx), ctx=ctx
+            )
 
         return (cmd_name if cmd else None), cmd, args[1:]
 
@@ -1464,10 +1460,18 @@ class Parameter:
                 )
             if required and deprecated:
                 raise ValueError(
-                    f"The {self.param_type_name} '{self.spec}' is"
+                    f"The {self.param_type_name} '{self._name_for_message()}' is"
                     " deprecated and still required. A deprecated"
                     f" {self.param_type_name} cannot be required."
                 )
+
+    def _name_for_message(self) -> str:
+        """The name used in construction errors: the parameter name for an
+        option, the upper case metavar for an argument.
+        """
+        if self.param_type_name == "option":
+            return self.name or ""
+        return self.spec
 
     def to_info_dict(self) -> dict[str, t.Any]:
         return {
@@ -1901,6 +1905,7 @@ class Option(Parameter):
         self._flag_needs_value = self.prompt is not None and not self.prompt_required
 
         has_flag_value = flag_value is not UNSET
+        given_flag_value = flag_value
         if is_flag is None:
             if has_flag_value:
                 is_flag = True
@@ -1923,16 +1928,9 @@ class Option(Parameter):
         self.is_bool_flag: bool = self.is_flag and isinstance(
             self.type, types.BoolParamType
         )
-        self.flag_value: t.Any = None if flag_value is UNSET else flag_value
-
-        # A boolean flag that is not given is off, unless told otherwise.
-        if (
-            self.is_bool_flag
-            and self.default is UNSET
-            and not self.required
-            and not multiple
-        ):
-            self.default = False
+        # Stays UNSET when not given, so that "did the user pass one?" can
+        # be asked. Use ``flag_activation_value`` for the value in effect.
+        self.flag_value: t.Any = given_flag_value
 
         self.count = count
         if count:
@@ -1964,13 +1962,26 @@ class Option(Parameter):
                 if self.is_flag:
                     raise TypeError("'count' is not valid with 'is_flag'.")
 
+    @property
+    def flag_activation_value(self) -> t.Any:
+        """The value the callback receives when this flag is given. A
+        missing :attr:`flag_value` resolves to ``True`` for flags and to
+        ``None`` for other options.
+        """
+        if self.flag_value is UNSET:
+            return True if self.is_flag else None
+        return self.flag_value
+
     def to_info_dict(self) -> dict[str, t.Any]:
         info = super().to_info_dict()
+        if self.default is UNSET and self.is_bool_flag and not self.required and not self.multiple:
+            # Boolean flags are off unless told otherwise.
+            info["default"] = False
         info.update(
             help=self.help,
             prompt=self.prompt,
             is_flag=self.is_flag,
-            flag_value=self.flag_value,
+            flag_value=self.flag_activation_value,
             count=self.count,
             hidden=self.hidden,
         )
@@ -2099,7 +2110,7 @@ class Option(Parameter):
                 opts=self.opts,
                 dest=self.name,
                 action=action,
-                const=self.flag_value,
+                const=self.flag_activation_value,
             )
 
     @property
@@ -2246,7 +2257,15 @@ class Option(Parameter):
             # default", so the flag value is the default. It is returned as
             # is, even if callable.
             if value is True and self.is_flag and not self.is_bool_flag:
-                return self.flag_value
+                return self.flag_activation_value
+            # A boolean flag that is not given is off, unless told otherwise.
+            if (
+                value is UNSET
+                and self.is_bool_flag
+                and not self.required
+                and not self.multiple
+            ):
+                return False
         if call and callable(value):
             value = value()
         return value
@@ -2300,11 +2319,11 @@ class Option(Parameter):
         if self.is_flag and not self.is_bool_flag:
             # The variable either names the flag value exactly, or switches
             # the flag on or off with a boolean word.
-            if rv == self.flag_value:
-                return self.flag_value
+            if rv == self.flag_activation_value:
+                return self.flag_activation_value
             word = rv.strip().lower()
             if word in types._TRUE_WORDS:
-                return self.flag_value
+                return self.flag_activation_value
             if word in types._FALSE_WORDS:
                 return False
             return None
@@ -2329,13 +2348,16 @@ class Option(Parameter):
                 value = self.prompt_for_value(ctx)
                 source = ParameterSource.PROMPT
             else:
-                value = self.flag_value
+                value = self.flag_activation_value
         elif (
             self.multiple
             and isinstance(value, (list, tuple))
             and any(v is _flag_needs_value for v in value)
         ):
-            value = [self.flag_value if v is _flag_needs_value else v for v in value]
+            value = [
+                self.flag_activation_value if v is _flag_needs_value else v
+                for v in value
+            ]
             source = ParameterSource.COMMANDLINE
         elif (
             source is ParameterSource.DEFAULT

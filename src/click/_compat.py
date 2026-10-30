@@ -26,9 +26,9 @@ def strip_ansi(value: str) -> str:
     return _ansi_re.sub("", value)
 
 
-def term_len(value: str) -> int:
+def term_len(x: str) -> int:
     """Length of ``value`` as it would appear on a terminal."""
-    return len(strip_ansi(value))
+    return len(strip_ansi(x))
 
 
 def _stream_is_tty(stream: t.Any) -> bool:

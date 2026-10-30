@@ -484,6 +484,33 @@ _FALSE_WORDS = frozenset({"0", "false", "f", "no", "n", "off"})
 class BoolParamType(ParamType):
     name = "boolean"
 
+    #: Words that count as true or false, compared in lower case. An empty
+    #: string is false.
+    bool_states: t.ClassVar[dict[str, bool]] = {
+        "1": True,
+        "0": False,
+        "yes": True,
+        "no": False,
+        "true": True,
+        "false": False,
+        "on": True,
+        "off": False,
+        "t": True,
+        "f": False,
+        "y": True,
+        "n": False,
+        "": False,
+    }
+
+    @staticmethod
+    def str_to_bool(value: str | bool) -> bool | None:
+        """Convert a string to a boolean, or return ``None`` if it is not a
+        recognized word. Booleans are returned as they are.
+        """
+        if isinstance(value, bool):
+            return value
+        return BoolParamType.bool_states.get(value.strip().lower())
+
     def convert(
         self, value: t.Any, param: Parameter | None, ctx: Context | None
     ) -> t.Any:
@@ -491,13 +518,16 @@ class BoolParamType(ParamType):
             return value
         if isinstance(value, int) and value in (0, 1):
             return bool(value)
-        word = str(value).strip().lower()
-        if word in _TRUE_WORDS:
-            return True
-        if word in _FALSE_WORDS:
-            return False
+        result = self.str_to_bool(str(value))
+        if result is not None:
+            return result
+        states = ", ".join(sorted(self.bool_states))
         self.fail(
-            _("{value!r} is not a valid boolean.").format(value=value), param, ctx
+            _("{value!r} is not a valid boolean. Recognized values: {states}").format(
+                value=value, states=states
+            ),
+            param,
+            ctx,
         )
 
     def __repr__(self) -> str:
@@ -686,8 +716,10 @@ class Path(ParamType[PathValue]):
         if self.resolve_path:
             path = os.path.realpath(path)
 
-        shown = format_filename(value)
         kind = self.name.title()
+
+        def shown() -> str:
+            return format_filename(value)
 
         try:
             info = os.stat(path)
@@ -695,20 +727,20 @@ class Path(ParamType[PathValue]):
             if not self.exists:
                 return self.coerce_path_result(path)
             self.fail(
-                _("{name} {filename!r} does not exist.").format(name=kind, filename=shown),
+                _("{name} {filename!r} does not exist.").format(name=kind, filename=shown()),
                 param,
                 ctx,
             )
 
         if not self.file_okay and stat.S_ISREG(info.st_mode):
             self.fail(
-                _("{name} {filename!r} is a file.").format(name=kind, filename=shown),
+                _("{name} {filename!r} is a file.").format(name=kind, filename=shown()),
                 param,
                 ctx,
             )
         if not self.dir_okay and stat.S_ISDIR(info.st_mode):
             self.fail(
-                _("{name} {filename!r} is a directory.").format(name=kind, filename=shown),
+                _("{name} {filename!r} is a directory.").format(name=kind, filename=shown()),
                 param,
                 ctx,
             )
@@ -720,7 +752,7 @@ class Path(ParamType[PathValue]):
         )
         for wanted, mode, message in checks:
             if wanted and not os.access(path, mode):
-                self.fail(message.format(name=kind, filename=shown), param, ctx)
+                self.fail(message.format(name=kind, filename=shown()), param, ctx)
 
         return self.coerce_path_result(path)
 
@@ -786,7 +818,7 @@ def _guess_type(default: t.Any) -> t.Any:
     return type(default)
 
 
-def convert_type(ty: t.Any | None, default: t.Any | None = None) -> ParamType:
+def convert_type(ty: t.Any | None = None, default: t.Any | None = None) -> ParamType:
     """Turn a Python type, a tuple of types, a :class:`ParamType` or a
     callable into a :class:`ParamType`. Without ``ty`` the type is guessed
     from ``default``.
