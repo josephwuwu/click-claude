@@ -79,3 +79,10 @@ Windows, and 1 is marked as an expected failure upstream. The stress tests
 (`-m stress`) are deselected by default, as upstream does; they pass when run
 explicitly (all 1000 pager cases and a 1 in 20 sample of the 30000 stream
 lifecycle cases were run).
+
+## Credits
+
+Created by [josephwuwu](https://github.com/josephwuwu), with the
+implementation written by Claude (Anthropic) as a clean-room reimplementation
+of [Click](https://github.com/pallets/click). Click is © Pallets and
+distributed under the BSD-3-Clause license.
